@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Object {
+pub enum Object {
     Undefined,
     Ellipsis,
     None,

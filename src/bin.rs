@@ -1,20 +1,9 @@
-mod evaluate;
-mod object;
-mod parse;
-mod prepare;
-mod run;
-mod types;
-
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use crate::object::Object;
-use crate::parse::{parse, ParseResult};
-use crate::prepare::prepare;
-use crate::run::{Frame, RunResult};
-use crate::types::Node;
+use monty::Executor;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -68,31 +57,5 @@ fn read_file(file_path: &str) -> Result<String, String> {
     match fs::read_to_string(file_path) {
         Ok(contents) => Ok(contents),
         Err(err) => Err(format!("Error reading file: {err}")),
-    }
-}
-
-struct Executor {
-    initial_namespace: Vec<Object>,
-    nodes: Vec<Node>,
-}
-
-impl Executor {
-    fn new(code: &str, filename: &str, input_names: &[&str]) -> ParseResult<Self> {
-        let nodes = parse(code, filename)?;
-        // dbg!(&nodes);
-        let (initial_namespace, nodes) = prepare(nodes, input_names)?;
-        // dbg!(&initial_namespace, &nodes);
-        Ok(Self {
-            initial_namespace,
-            nodes,
-        })
-    }
-
-    fn run(&self, inputs: Vec<Object>) -> RunResult<()> {
-        let mut namespace = self.initial_namespace.clone();
-        for (i, input) in inputs.into_iter().enumerate() {
-            namespace[i] = input;
-        }
-        Frame::new(namespace).execute(&self.nodes)
     }
 }

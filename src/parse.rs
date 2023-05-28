@@ -25,7 +25,7 @@ pub struct Parser {
 impl Parser {
     fn new(code: &str) -> Self {
         // position of each line in the source code, to convert indexes to line number and column number
-        let mut line_ends = vec![0];
+        let mut line_ends = vec![];
         for (i, c) in code.chars().enumerate() {
             if c == '\n' {
                 line_ends.push(i);
@@ -284,13 +284,14 @@ impl Parser {
     }
 
     fn index_to_position(&self, index: usize) -> CodePosition {
-        for (line, line_end) in self.line_ends.iter().enumerate() {
+        let mut last = 0;
+        for (line_no, line_end) in self.line_ends.iter().enumerate() {
             if index <= *line_end {
-                return CodePosition::new(line, index - self.line_ends[line - 1]);
+                return CodePosition::new(line_no + 1, index - last);
             }
+            last = *line_end;
         }
-        let len = self.line_ends.len();
-        CodePosition::new(len, index - self.line_ends[len - 1])
+        CodePosition::new(self.line_ends.len() + 1, index - last)
     }
 }
 

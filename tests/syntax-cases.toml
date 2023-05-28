@@ -1,0 +1,57 @@
+[[cases]]
+code = "1 + 1"
+expected = """
+[
+    Expr(
+        ExprLoc {
+            position: CodeRange {
+                start: CodePosition {
+                    line: 1,
+                    column: 0,
+                },
+                end: CodePosition {
+                    line: 1,
+                    column: 5,
+                },
+            },
+            expr: Op {
+                left: ExprLoc {
+                    position: CodeRange {
+                        start: CodePosition {
+                            line: 1,
+                            column: 0,
+                        },
+                        end: CodePosition {
+                            line: 1,
+                            column: 1,
+                        },
+                    },
+                    expr: Constant(
+                        Int(
+                            1,
+                        ),
+                    ),
+                },
+                op: Add,
+                right: ExprLoc {
+                    position: CodeRange {
+                        start: CodePosition {
+                            line: 1,
+                            column: 4,
+                        },
+                        end: CodePosition {
+                            line: 1,
+                            column: 5,
+                        },
+                    },
+                    expr: Constant(
+                        Int(
+                            1,
+                        ),
+                    ),
+                },
+            },
+        },
+    ),
+]
+"""
