@@ -230,26 +230,30 @@ impl Object {
         }
     }
 
-    pub(crate) fn attr_call<'c, 'd>(&self, attr: &Attr, _args: Vec<Cow<'d, Self>>) -> RunResult<'c, Cow<'d, Object>> {
+    pub(crate) fn attr_call<'c, 'd>(
+        &mut self,
+        attr: &Attr,
+        args: Vec<Cow<'d, Self>>,
+    ) -> RunResult<'c, Cow<'d, Object>> {
         match (self, attr) {
             (Self::List(v), Attr::Foobar) => Ok(Cow::Owned(Object::Int(v.len() as i64))),
-            // (Self::List(v), Attr::Append) => {
-            //     if args.len() != 1 {
-            //         exc_err!(ExcType::TypeError; "{attr} takes exactly exactly one argument ({} given)", args.len())
-            //     } else {
-            //         v.push(args[0].clone().into_owned());
-            //         Ok(Cow::Owned(Self::None))
-            //     }
-            // }
-            // (Self::List(v), Attr::Insert) => {
-            //     if args.len() != 2 {
-            //         exc_err!(ExcType::TypeError; "{attr} expected 2 arguments, got {}", args.len())
-            //     } else {
-            //         let index = args[0].as_int()? as usize;
-            //         v.insert(index, args[1].clone().into_owned());
-            //         Ok(Cow::Owned(Self::None))
-            //     }
-            // }
+            (Self::List(v), Attr::Append) => {
+                if args.len() != 1 {
+                    exc_err!(ExcType::TypeError; "{attr} takes exactly exactly one argument ({} given)", args.len())
+                } else {
+                    v.push(args[0].clone().into_owned());
+                    Ok(Cow::Owned(Self::None))
+                }
+            }
+            (Self::List(v), Attr::Insert) => {
+                if args.len() != 2 {
+                    exc_err!(ExcType::TypeError; "{attr} expected 2 arguments, got {}", args.len())
+                } else {
+                    let index = args[0].as_int()? as usize;
+                    v.insert(index, args[1].clone().into_owned());
+                    Ok(Cow::Owned(Self::None))
+                }
+            }
             (s, _) => exc_err!(ExcType::AttributeError; "'{}' object has no attribute '{attr}'", s.type_str()),
         }
     }

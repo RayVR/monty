@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::evaluate::Evaluator;
+use crate::evaluate::{evaluate, evaluate_bool};
 use crate::exceptions::{exc, exc_err, internal_err, ExcType, Exception, InternalRunError, RunError, StackFrame};
 use crate::expressions::{Exit, ExprLoc, Identifier, Node};
 use crate::object::Object;
@@ -60,28 +60,28 @@ impl<'c> RunFrame<'c> {
         Ok(None)
     }
 
-    fn execute_expr<'d>(&'d self, expr: &'d ExprLoc<'c>) -> RunResult<'c, Cow<'d, Object>> {
+    fn execute_expr<'d>(&'d mut self, expr: &'d ExprLoc<'c>) -> RunResult<'c, Cow<'d, Object>> {
         // it seems the struct creation is optimized away, and has no cost
-        match Evaluator::new(&self.namespace).evaluate(expr) {
+        match evaluate(&mut self.namespace, expr) {
             Ok(object) => Ok(object),
             Err(mut e) => {
-                self.set_name(&mut e);
+                set_name(self.name, &mut e);
                 Err(e)
             }
         }
     }
 
-    fn execute_expr_bool(&self, expr: &ExprLoc<'c>) -> RunResult<'c, bool> {
-        match Evaluator::new(&self.namespace).evaluate_bool(expr) {
+    fn execute_expr_bool(&mut self, expr: &ExprLoc<'c>) -> RunResult<'c, bool> {
+        match evaluate_bool(&mut self.namespace, expr) {
             Ok(object) => Ok(object),
             Err(mut e) => {
-                self.set_name(&mut e);
+                set_name(self.name, &mut e);
                 Err(e)
             }
         }
     }
 
-    fn raise(&self, op_exc_expr: &Option<ExprLoc<'c>>) -> RunResult<'c, ()> {
+    fn raise(&mut self, op_exc_expr: &Option<ExprLoc<'c>>) -> RunResult<'c, ()> {
         if let Some(exc_expr) = op_exc_expr {
             let object = self.execute_expr(exc_expr)?;
             let exc = match object.into_owned() {
@@ -152,12 +152,12 @@ impl<'c> RunFrame<'c> {
     fn stack_frame(&self, position: &CodeRange<'c>) -> StackFrame<'c> {
         StackFrame::new(position, self.name, &self.parent)
     }
+}
 
-    fn set_name(&self, error: &mut RunError<'c>) {
-        if let RunError::Exc(ref mut exc) = error {
-            if let Some(ref mut stack_frame) = exc.frame {
-                stack_frame.frame_name = Some(self.name);
-            }
+fn set_name<'c>(name: &'c str, error: &mut RunError<'c>) {
+    if let RunError::Exc(ref mut exc) = error {
+        if let Some(ref mut stack_frame) = exc.frame {
+            stack_frame.frame_name = Some(name);
         }
     }
 }

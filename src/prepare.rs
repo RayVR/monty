@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 
 use ahash::AHashMap;
 
-use crate::evaluate::Evaluator;
+use crate::evaluate::evaluate;
 use crate::exceptions::{internal_err, ExcType, Exception, ExceptionRaise};
 use crate::expressions::{Expr, ExprLoc, Function, Identifier, Kwarg, Node};
 use crate::object::Object;
@@ -219,9 +219,8 @@ impl Prepare {
         let consts: Option<&[bool]> = if self.hit_loop { None } else { Some(&self.consts) };
 
         if can_be_const(&expr, consts) {
-            let evaluate = Evaluator::new(&self.namespace);
             let tmp_expr_loc = ExprLoc { position, expr };
-            let object = evaluate.evaluate(&tmp_expr_loc)?;
+            let object = evaluate(&mut self.namespace, &tmp_expr_loc)?;
             Ok(ExprLoc {
                 position,
                 expr: Expr::Constant(object.into_owned()),

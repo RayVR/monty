@@ -1,9 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use crate::evaluate::Evaluator;
 use crate::exceptions::{exc_err, internal_err, ExcType, Exception, InternalRunError};
-use crate::expressions::{ExprLoc, Kwarg};
 use crate::parse_error::{ParseError, ParseResult};
 use crate::run::RunResult;
 use crate::Object;
@@ -58,16 +56,10 @@ impl Types {
         }
     }
 
-    pub fn call_function<'c, 'd>(
-        &self,
-        eval: &Evaluator<'d>,
-        args: &'d [ExprLoc<'c>],
-        _kwargs: &'d [Kwarg],
-    ) -> RunResult<'c, Cow<'d, Object>> {
+    pub fn call_function<'c, 'd>(&self, args: Vec<Cow<'d, Object>>) -> RunResult<'c, Cow<'d, Object>> {
         match self {
             Self::BuiltinFunction(FunctionTypes::Print) => {
-                for (i, arg) in args.iter().enumerate() {
-                    let object = eval.evaluate(arg)?;
+                for (i, object) in args.iter().enumerate() {
                     if i == 0 {
                         print!("{object}");
                     } else {
@@ -78,40 +70,28 @@ impl Types {
                 Ok(Cow::Owned(Object::None))
             }
             Self::BuiltinFunction(FunctionTypes::Len) => {
-                let object = one_arg("len", eval, args)?;
+                if args.len() != 1 {
+                    return exc_err!(ExcType::TypeError; "len() takes exactly exactly one argument ({} given)", args.len());
+                }
+                let object = &args[0];
                 match object.len() {
                     Some(len) => Ok(Cow::Owned(Object::Int(len as i64))),
                     None => exc_err!(ExcType::TypeError; "Object of type {} has no len()", object),
                 }
             }
             Self::Exceptions(exc_type) => {
-                let args: Vec<Object> = args
-                    .iter()
-                    .map(|a| Ok(eval.evaluate(a)?.into_owned()))
-                    .collect::<RunResult<_>>()?;
+                let args: Vec<Object> = args.into_iter().map(|a| a.into_owned()).collect();
                 Ok(Cow::Owned(Object::Exc(Exception::call(args, *exc_type))))
             }
             Self::Range => {
                 if args.len() != 1 {
                     internal_err!(InternalRunError::TodoError; "range() takes exactly one argument")
                 } else {
-                    let object = eval.evaluate(&args[0])?;
+                    let object = &args[0];
                     let size = object.as_int()?;
                     Ok(Cow::Owned(Object::Range(size)))
                 }
             }
         }
-    }
-}
-
-fn one_arg<'c, 'd>(
-    name: impl fmt::Display,
-    eval: &Evaluator<'d>,
-    args: &'d [ExprLoc<'c>],
-) -> RunResult<'c, Cow<'d, Object>> {
-    if args.len() != 1 {
-        exc_err!(ExcType::TypeError; "{}() takes exactly exactly one argument ({} given)", name, args.len())
-    } else {
-        eval.evaluate(&args[0])
     }
 }
