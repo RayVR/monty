@@ -1,6 +1,7 @@
 mod evaluate;
 mod exceptions;
 mod expressions;
+mod heap;
 mod literal;
 mod object;
 mod object_types;
@@ -16,16 +17,19 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use crate::exceptions::{InternalRunError, RunError};
 pub use crate::expressions::Exit;
 use crate::expressions::Node;
+use crate::heap::Heap;
 pub use crate::object::Object;
 use crate::parse::parse;
 pub use crate::parse_error::{ParseError, ParseResult};
 use crate::prepare::prepare;
 use crate::run::RunFrame;
+use std::cell::RefCell;
 
 #[derive(Debug)]
 pub struct Executor<'c> {
     initial_namespace: Vec<Object>,
     nodes: Vec<Node<'c>>,
+    heap: RefCell<Heap>,
 }
 
 impl<'c> Executor<'c> {
@@ -37,10 +41,12 @@ impl<'c> Executor<'c> {
         Ok(Self {
             initial_namespace,
             nodes,
+            heap: RefCell::new(Heap::new()),
         })
     }
 
     pub fn run(&self, inputs: Vec<Object>) -> Result<Exit<'c>, InternalRunError> {
+        self.heap.borrow_mut().clear();
         let mut namespace = self.initial_namespace.clone();
         for (i, input) in inputs.into_iter().enumerate() {
             namespace[i] = input;

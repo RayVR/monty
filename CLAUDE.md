@@ -33,7 +33,11 @@ cargo run -- <file.py>
 
 ALWAYS run `make lint` after making changes and fix all suggestions to maintain code quality.
 
-Unless the code you're adding is completely trivial, add a comprehensive but concise docstring or comments to
-explain what the function does and why. If you see a comment that's out of date - please update the comment.
+IMPORTANT: every struct, enum and function should be a comprehensive but concise docstring to
+explain what it does and why and any considerations or potential foot-guns of using that type.
+
+Similarly, should add lots of comments to code.
+
+If you see a comment or docstring that's out of date - you MUST update it to be correct.
 
 NOTE: COMMENTS AND DOCSTRINGS ARE EXTREMELY IMPORTANT TO THE LONG TERM HEALTH OF THE PROJECT.
