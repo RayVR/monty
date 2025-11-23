@@ -5,7 +5,7 @@ use crate::{exceptions::ExceptionRaise, expressions::FrameExit, heap::Heap, obje
 
 #[derive(Debug)]
 pub enum Exit<'c, 'h> {
-    Return(ReturnObject<'h>),
+    Return(Value<'h>),
     // Yield(ReturnObject<'h>),
     Raise(ExceptionRaise<'c>),
 }
@@ -22,25 +22,25 @@ impl fmt::Display for Exit<'_, '_> {
 impl<'c, 'h> Exit<'c, 'h> {
     pub(crate) fn new(frame_exit: FrameExit<'c>, heap: &'h Heap) -> Self {
         match frame_exit {
-            FrameExit::Return(object) => Self::Return(ReturnObject { object, heap }),
+            FrameExit::Return(object) => Self::Return(Value { object, heap }),
             FrameExit::Raise(exc) => Self::Raise(exc),
         }
     }
 }
 
 #[derive(Debug)]
-pub struct ReturnObject<'h> {
+pub struct Value<'h> {
     object: Object,
     heap: &'h Heap,
 }
 
-impl fmt::Display for ReturnObject<'_> {
+impl fmt::Display for Value<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.str())
     }
 }
 
-impl<'h> ReturnObject<'h> {
+impl<'h> Value<'h> {
     /// User facing representation of the object, should match python's `str(object)`
     #[must_use]
     pub fn str(&self) -> Cow<'h, str> {
@@ -89,10 +89,10 @@ impl std::error::Error for ConversionError {}
 
 /// Attempts to convert a ReturnObject to an i64 integer.
 /// Returns an error if the object is not an Int variant.
-impl TryFrom<&ReturnObject<'_>> for i64 {
+impl TryFrom<&Value<'_>> for i64 {
     type Error = ConversionError;
 
-    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+    fn try_from(value: &Value<'_>) -> Result<Self, Self::Error> {
         match value.object {
             Object::Int(i) => Ok(i),
             _ => Err(ConversionError {
@@ -106,10 +106,10 @@ impl TryFrom<&ReturnObject<'_>> for i64 {
 /// Attempts to convert a ReturnObject to an f64 float.
 /// Returns an error if the object is not a Float or Int variant.
 /// Int values are automatically converted to f64.
-impl TryFrom<&ReturnObject<'_>> for f64 {
+impl TryFrom<&Value<'_>> for f64 {
     type Error = ConversionError;
 
-    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+    fn try_from(value: &Value<'_>) -> Result<Self, Self::Error> {
         match value.object {
             Object::Float(f) => Ok(f),
             Object::Int(i) => Ok(i as f64),
@@ -123,10 +123,10 @@ impl TryFrom<&ReturnObject<'_>> for f64 {
 
 /// Attempts to convert a ReturnObject to a String.
 /// Returns an error if the object is not a heap-allocated Str variant.
-impl TryFrom<&ReturnObject<'_>> for String {
+impl TryFrom<&Value<'_>> for String {
     type Error = ConversionError;
 
-    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+    fn try_from(value: &Value<'_>) -> Result<Self, Self::Error> {
         if let Object::Ref(id) = value.object {
             if let HeapData::Str(s) = value.heap.get(id) {
                 return Ok(s.clone());
@@ -142,10 +142,10 @@ impl TryFrom<&ReturnObject<'_>> for String {
 /// Attempts to convert a ReturnObject to a bool.
 /// Returns an error if the object is not a True or False variant.
 /// Note: This does NOT use Python's truthiness rules (use Object::bool for that).
-impl TryFrom<&ReturnObject<'_>> for bool {
+impl TryFrom<&Value<'_>> for bool {
     type Error = ConversionError;
 
-    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+    fn try_from(value: &Value<'_>) -> Result<Self, Self::Error> {
         match value.object {
             Object::True => Ok(true),
             Object::False => Ok(false),

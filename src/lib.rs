@@ -16,7 +16,7 @@ mod run;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use crate::exceptions::{InternalRunError, RunError};
-pub use crate::exit::{Exit, ReturnObject};
+pub use crate::exit::{Exit, Value};
 use crate::expressions::Node;
 use crate::heap::{Heap, HeapData};
 use crate::literal::Literal;
