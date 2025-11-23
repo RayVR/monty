@@ -4,24 +4,24 @@ extern crate test;
 
 use test::{black_box, Bencher};
 
-use monty::{Executor, Exit, Object};
+use monty::{Executor, Exit};
 
 use pyo3::prelude::*;
 
 #[bench]
 fn add_two_monty(bench: &mut Bencher) {
-    let ex = Executor::new("1 + 2", "test.py", &[]).unwrap();
+    let mut ex = Executor::new("1 + 2", "test.py", &[]).unwrap();
     let v = ex.run(vec![]).unwrap();
     match v {
-        Exit::Return(Object::Int(v)) => assert_eq!(v, 3),
+        Exit::Return(ref value) => {
+            let int_value: i64 = value.try_into().unwrap();
+            assert_eq!(int_value, 3)
+        }
         _ => panic!("unexpected exit: {:?}", v),
     }
 
     bench.iter(|| {
-        let r = match ex.run(vec![]).unwrap() {
-            Exit::Return(Object::Int(v)) => v,
-            _ => -1,
-        };
+        let r = ex.run(vec![]).unwrap();
         black_box(r);
     });
 }
@@ -65,12 +65,13 @@ len(v)
 
 #[bench]
 fn loop_mod_13_monty(bench: &mut Bencher) {
-    let ex = Executor::new(LOOP_MOD_13_CODE, "test.py", &[]).unwrap();
+    let mut ex = Executor::new(LOOP_MOD_13_CODE, "test.py", &[]).unwrap();
     let v = ex.run(vec![]).unwrap();
-    match v {
-        Exit::Return(Object::Int(v)) => assert_eq!(v, 77),
+    let int_value: i64 = match v {
+        Exit::Return(ref value) => value.try_into().unwrap(),
         _ => panic!("unexpected exit: {:?}", v),
-    }
+    };
+    assert_eq!(int_value, 77);
 
     bench.iter(|| {
         black_box(ex.run(vec![]).unwrap());
@@ -113,7 +114,7 @@ fn loop_mod_13_cpython(bench: &mut Bencher) {
 #[bench]
 fn end_to_end_monty(bench: &mut Bencher) {
     bench.iter(|| {
-        let ex = Executor::new(black_box("1 + 2"), "test.py", &[]).unwrap();
+        let mut ex = Executor::new(black_box("1 + 2"), "test.py", &[]).unwrap();
         black_box(ex.run(vec![]).unwrap());
     });
 }

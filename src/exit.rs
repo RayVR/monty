@@ -1,5 +1,6 @@
 use std::{borrow::Cow, fmt};
 
+use crate::heap::HeapData;
 use crate::{exceptions::ExceptionRaise, expressions::FrameExit, heap::Heap, object::Object};
 
 #[derive(Debug)]
@@ -56,5 +57,102 @@ impl<'h> ReturnObject<'h> {
     #[must_use]
     pub fn type_str(&self) -> &'static str {
         self.object.type_str(self.heap)
+    }
+
+    /// Checks if the return object is None
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        matches!(self.object, Object::None)
+    }
+
+    /// Checks if the return object is Ellipsis
+    #[must_use]
+    pub fn is_ellipsis(&self) -> bool {
+        matches!(self.object, Object::Ellipsis)
+    }
+}
+
+/// Conversion error type for failed conversions from ReturnObject
+#[derive(Debug)]
+pub struct ConversionError {
+    pub expected: &'static str,
+    pub actual: &'static str,
+}
+
+impl fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "expected {}, got {}", self.expected, self.actual)
+    }
+}
+
+impl std::error::Error for ConversionError {}
+
+/// Attempts to convert a ReturnObject to an i64 integer.
+/// Returns an error if the object is not an Int variant.
+impl TryFrom<&ReturnObject<'_>> for i64 {
+    type Error = ConversionError;
+
+    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+        match value.object {
+            Object::Int(i) => Ok(i),
+            _ => Err(ConversionError {
+                expected: "int",
+                actual: value.type_str(),
+            }),
+        }
+    }
+}
+
+/// Attempts to convert a ReturnObject to an f64 float.
+/// Returns an error if the object is not a Float or Int variant.
+/// Int values are automatically converted to f64.
+impl TryFrom<&ReturnObject<'_>> for f64 {
+    type Error = ConversionError;
+
+    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+        match value.object {
+            Object::Float(f) => Ok(f),
+            Object::Int(i) => Ok(i as f64),
+            _ => Err(ConversionError {
+                expected: "float",
+                actual: value.type_str(),
+            }),
+        }
+    }
+}
+
+/// Attempts to convert a ReturnObject to a String.
+/// Returns an error if the object is not a heap-allocated Str variant.
+impl TryFrom<&ReturnObject<'_>> for String {
+    type Error = ConversionError;
+
+    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+        if let Object::Ref(id) = value.object {
+            if let HeapData::Str(s) = value.heap.get(id) {
+                return Ok(s.clone());
+            }
+        }
+        Err(ConversionError {
+            expected: "str",
+            actual: value.type_str(),
+        })
+    }
+}
+
+/// Attempts to convert a ReturnObject to a bool.
+/// Returns an error if the object is not a True or False variant.
+/// Note: This does NOT use Python's truthiness rules (use Object::bool for that).
+impl TryFrom<&ReturnObject<'_>> for bool {
+    type Error = ConversionError;
+
+    fn try_from(value: &ReturnObject<'_>) -> Result<Self, Self::Error> {
+        match value.object {
+            Object::True => Ok(true),
+            Object::False => Ok(false),
+            _ => Err(ConversionError {
+                expected: "bool",
+                actual: value.type_str(),
+            }),
+        }
     }
 }
