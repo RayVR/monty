@@ -24,7 +24,7 @@ Monty is a **sandboxed Python interpreter** written in Rust. Unlike embedding CP
 
 **Key Design Decisions:**
 
-1. **Use RustPython's Parser**: Leverage proven, maintained parsing infrastructure
+1. **Use Ruff's Parser**: Leverage the maintained `ruff_python_parser` infrastructure
 2. **Custom Runtime**: Full control over execution model and optimizations
 3. **No Garbage Collection**: Rust ownership handles memory (current limitation: no reference cycles)
 4. **Compile-time Optimization**: Aggressive constant folding and dead code elimination
@@ -41,7 +41,7 @@ Monty is a **sandboxed Python interpreter** written in Rust. Unlike embedding CP
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      PHASE 1: PARSE                             │
-│  RustPython Parser → Internal AST (Node<'c>, Expr<'c>)          │
+│  Ruff Parser → Internal AST (Node<'c>, Expr<'c>)                │
 │  - Convert Python AST to internal representation                │
 │  - Track code positions (CodeRange) for error messages          │
 │  - Store code snippets for tracebacks                           │
@@ -101,7 +101,7 @@ pub enum Node<'c> {
 
 **Key Conversions:**
 
-1. **RustPython AST → Internal AST**: Maps `rustpython_parser::ast::Stmt` to `Node<'c>`
+1. **Ruff AST → Internal AST**: Maps `ruff_python_ast::Stmt` to `Node<'c>`
 2. **Position Tracking**: Every node has a `CodeRange` with:
    - Filename
    - Start/end line and column numbers
@@ -373,7 +373,7 @@ impl<'c> Executor<'c> {
 ```
 
 ### src/parse.rs (518 lines)
-**Responsibility**: Convert RustPython AST to internal representation
+**Responsibility**: Convert Ruff AST to the internal representation
 
 **Key Functions:**
 - `parse_program()`: Entry point, returns `Vec<Node<'c>>`

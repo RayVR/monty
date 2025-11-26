@@ -1,18 +1,21 @@
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
-use num::ToPrimitive;
-use rustpython_parser::ast::{
-    Boolop, Cmpop, Constant, Expr as AstExpr, ExprKind, Keyword, Operator as AstOperator, Stmt, StmtKind, TextRange,
+use ruff_python_ast::{
+    self as ast, BoolOp, CmpOp, ElifElseClause, Expr as AstExpr, Keyword, Number, Operator as AstOperator, Stmt,
 };
-use rustpython_parser::parse_program;
+use ruff_python_parser::parse_module;
+use ruff_text_size::TextRange;
 
 use crate::expressions::{Const, Expr, ExprLoc, Function, Identifier, Kwarg, Node};
 use crate::operators::{CmpOperator, Operator};
 use crate::parse_error::{ParseError, ParseResult};
 
 pub(crate) fn parse<'c>(code: &'c str, filename: &'c str) -> ParseResult<'c, Vec<Node<'c>>> {
-    match parse_program(code, filename) {
-        Ok(ast) => Parser::new(code, filename).parse_statements(ast),
+    match parse_module(code) {
+        Ok(parsed) => {
+            let module = parsed.into_syntax();
+            Parser::new(code, filename).parse_statements(module.body)
+        }
         Err(e) => Err(ParseError::Parsing(e.to_string())),
     }
 }
@@ -43,88 +46,90 @@ impl<'c> Parser<'c> {
         statements.into_iter().map(|f| self.parse_statement(f)).collect()
     }
 
+    fn parse_elif_else_clauses(&self, clauses: Vec<ElifElseClause>) -> ParseResult<'c, Vec<Node<'c>>> {
+        let mut tail: Vec<Node<'c>> = Vec::new();
+        for clause in clauses.into_iter().rev() {
+            match clause.test {
+                Some(test) => {
+                    let test = self.parse_expression(test)?;
+                    let body = self.parse_statements(clause.body)?;
+                    let or_else = tail;
+                    let nested = Node::If { test, body, or_else };
+                    tail = vec![nested];
+                }
+                None => {
+                    tail = self.parse_statements(clause.body)?;
+                }
+            }
+        }
+        Ok(tail)
+    }
+
     fn parse_statement(&self, statement: Stmt) -> ParseResult<'c, Node<'c>> {
-        match statement.node {
-            StmtKind::FunctionDef {
-                name: _,
-                args: _,
-                body: _,
-                decorator_list: _,
-                returns: _,
-                type_comment: _,
-            } => Err(ParseError::Todo("FunctionDef")),
-            StmtKind::AsyncFunctionDef {
-                name: _,
-                args: _,
-                body: _,
-                decorator_list: _,
-                returns: _,
-                type_comment: _,
-            } => Err(ParseError::Todo("AsyncFunctionDef")),
-            StmtKind::ClassDef {
-                name: _,
-                bases: _,
-                keywords: _,
-                body: _,
-                decorator_list: _,
-            } => Err(ParseError::Todo("ClassDef")),
-            StmtKind::Return { value } => match value {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                if function.is_async {
+                    Err(ParseError::Todo("AsyncFunctionDef"))
+                } else {
+                    Err(ParseError::Todo("FunctionDef"))
+                }
+            }
+            Stmt::ClassDef(_) => Err(ParseError::Todo("ClassDef")),
+            Stmt::Return(ast::StmtReturn { value, .. }) => match value {
                 Some(value) => Ok(Node::Return(self.parse_expression(*value)?)),
                 None => Ok(Node::ReturnNone),
             },
-            StmtKind::Delete { targets: _ } => Err(ParseError::Todo("Delete")),
-            StmtKind::Assign { targets, value, .. } => self.parse_assignment(first(targets)?, *value),
-            StmtKind::AugAssign { target, op, value } => Ok(Node::OpAssign {
+            Stmt::Delete(_) => Err(ParseError::Todo("Delete")),
+            Stmt::TypeAlias(_) => Err(ParseError::Todo("TypeAlias")),
+            Stmt::Assign(ast::StmtAssign { targets, value, .. }) => self.parse_assignment(first(targets)?, *value),
+            Stmt::AugAssign(ast::StmtAugAssign { target, op, value, .. }) => Ok(Node::OpAssign {
                 target: self.parse_identifier(*target)?,
                 op: convert_op(op),
                 object: self.parse_expression(*value)?,
             }),
-            StmtKind::AnnAssign { target, value, .. } => match value {
+            Stmt::AnnAssign(ast::StmtAnnAssign { target, value, .. }) => match value {
                 Some(value) => self.parse_assignment(*target, *value),
                 None => Ok(Node::Pass),
             },
-            StmtKind::For {
+            Stmt::For(ast::StmtFor {
+                is_async,
                 target,
                 iter,
                 body,
                 orelse,
                 ..
-            } => Ok(Node::For {
-                target: self.parse_identifier(*target)?,
-                iter: self.parse_expression(*iter)?,
-                body: self.parse_statements(body)?,
-                or_else: self.parse_statements(orelse)?,
-            }),
-            StmtKind::AsyncFor {
-                target: _,
-                iter: _,
-                body: _,
-                orelse: _,
-                type_comment: _,
-            } => Err(ParseError::Todo("AsyncFor")),
-            StmtKind::While {
-                test: _,
-                body: _,
-                orelse: _,
-            } => Err(ParseError::Todo("While")),
-            StmtKind::If { test, body, orelse } => {
+            }) => {
+                if is_async {
+                    return Err(ParseError::Todo("AsyncFor"));
+                }
+                Ok(Node::For {
+                    target: self.parse_identifier(*target)?,
+                    iter: self.parse_expression(*iter)?,
+                    body: self.parse_statements(body)?,
+                    or_else: self.parse_statements(orelse)?,
+                })
+            }
+            Stmt::While(_) => Err(ParseError::Todo("While")),
+            Stmt::If(ast::StmtIf {
+                test,
+                body,
+                elif_else_clauses,
+                ..
+            }) => {
                 let test = self.parse_expression(*test)?;
                 let body = self.parse_statements(body)?;
-                let or_else = self.parse_statements(orelse)?;
+                let or_else = self.parse_elif_else_clauses(elif_else_clauses)?;
                 Ok(Node::If { test, body, or_else })
             }
-            StmtKind::With {
-                items: _,
-                body: _,
-                type_comment: _,
-            } => Err(ParseError::Todo("With")),
-            StmtKind::AsyncWith {
-                items: _,
-                body: _,
-                type_comment: _,
-            } => Err(ParseError::Todo("AsyncWith")),
-            StmtKind::Match { subject: _, cases: _ } => Err(ParseError::Todo("Match")),
-            StmtKind::Raise { exc, cause: _ } => {
+            Stmt::With(ast::StmtWith { is_async, .. }) => {
+                if is_async {
+                    Err(ParseError::Todo("AsyncWith"))
+                } else {
+                    Err(ParseError::Todo("With"))
+                }
+            }
+            Stmt::Match(_) => Err(ParseError::Todo("Match")),
+            Stmt::Raise(ast::StmtRaise { exc, .. }) => {
                 // TODO add cause to Node::Raise
                 let expr = match exc {
                     Some(expr) => Some(self.parse_expression(*expr)?),
@@ -132,31 +137,23 @@ impl<'c> Parser<'c> {
                 };
                 Ok(Node::Raise(expr))
             }
-            StmtKind::Try {
-                body: _,
-                handlers: _,
-                orelse: _,
-                finalbody: _,
-            } => Err(ParseError::Todo("Try")),
-            StmtKind::TryStar {
-                body: _,
-                handlers: _,
-                orelse: _,
-                finalbody: _,
-            } => Err(ParseError::Todo("TryStar")),
-            StmtKind::Assert { test: _, msg: _ } => Err(ParseError::Todo("Assert")),
-            StmtKind::Import { names: _ } => Err(ParseError::Todo("Import")),
-            StmtKind::ImportFrom {
-                module: _,
-                names: _,
-                level: _,
-            } => Err(ParseError::Todo("ImportFrom")),
-            StmtKind::Global { names: _ } => Err(ParseError::Todo("Global")),
-            StmtKind::Nonlocal { names: _ } => Err(ParseError::Todo("Nonlocal")),
-            StmtKind::Expr { value } => Ok(Node::Expr(self.parse_expression(*value)?)),
-            StmtKind::Pass => Ok(Node::Pass),
-            StmtKind::Break => Err(ParseError::Todo("Break")),
-            StmtKind::Continue => Err(ParseError::Todo("Continue")),
+            Stmt::Try(ast::StmtTry { is_star, .. }) => {
+                if is_star {
+                    Err(ParseError::Todo("TryStar"))
+                } else {
+                    Err(ParseError::Todo("Try"))
+                }
+            }
+            Stmt::Assert(_) => Err(ParseError::Todo("Assert")),
+            Stmt::Import(_) => Err(ParseError::Todo("Import")),
+            Stmt::ImportFrom(_) => Err(ParseError::Todo("ImportFrom")),
+            Stmt::Global(_) => Err(ParseError::Todo("Global")),
+            Stmt::Nonlocal(_) => Err(ParseError::Todo("Nonlocal")),
+            Stmt::Expr(ast::StmtExpr { value, .. }) => Ok(Node::Expr(self.parse_expression(*value)?)),
+            Stmt::Pass(_) => Ok(Node::Pass),
+            Stmt::Break(_) => Err(ParseError::Todo("Break")),
+            Stmt::Continue(_) => Err(ParseError::Todo("Continue")),
+            Stmt::IpyEscapeCommand(_) => Err(ParseError::Todo("IpyEscapeCommand")),
         }
     }
 
@@ -169,13 +166,8 @@ impl<'c> Parser<'c> {
     }
 
     fn parse_expression(&self, expression: AstExpr) -> ParseResult<'c, ExprLoc<'c>> {
-        let AstExpr {
-            node,
-            range,
-            custom: (),
-        } = expression;
-        match node {
-            ExprKind::BoolOp { op, values } => {
+        match expression {
+            AstExpr::BoolOp(ast::ExprBoolOp { op, values, range, .. }) => {
                 if values.len() != 2 {
                     return Err(ParseError::Todo("BoolOp must have 2 values"));
                 }
@@ -191,8 +183,10 @@ impl<'c> Parser<'c> {
                     },
                 })
             }
-            ExprKind::NamedExpr { target: _, value: _ } => Err(ParseError::Todo("NamedExpr")),
-            ExprKind::BinOp { left, op, right } => {
+            AstExpr::Named(_) => Err(ParseError::Todo("NamedExpr")),
+            AstExpr::BinOp(ast::ExprBinOp {
+                left, op, right, range, ..
+            }) => {
                 let left = Box::new(self.parse_expression(*left)?);
                 let right = Box::new(self.parse_expression(*right)?);
                 Ok(ExprLoc {
@@ -204,91 +198,112 @@ impl<'c> Parser<'c> {
                     },
                 })
             }
-            ExprKind::UnaryOp { op: _, operand: _ } => Err(ParseError::Todo("UnaryOp")),
-            ExprKind::Lambda { args: _, body: _ } => Err(ParseError::Todo("Lambda")),
-            ExprKind::IfExp {
-                test: _,
-                body: _,
-                orelse: _,
-            } => Err(ParseError::Todo("IfExp")),
-            ExprKind::Dict { keys: _, values: _ } => Err(ParseError::Todo("Dict")),
-            ExprKind::Set { elts: _ } => Err(ParseError::Todo("Set")),
-            ExprKind::ListComp { elt: _, generators: _ } => Err(ParseError::Todo("ListComp")),
-            ExprKind::SetComp { elt: _, generators: _ } => Err(ParseError::Todo("SetComp")),
-            ExprKind::DictComp {
-                key: _,
-                value: _,
-                generators: _,
-            } => Err(ParseError::Todo("DictComp")),
-            ExprKind::GeneratorExp { elt: _, generators: _ } => Err(ParseError::Todo("GeneratorExp")),
-            ExprKind::Await { value: _ } => Err(ParseError::Todo("Await")),
-            ExprKind::Yield { value: _ } => Err(ParseError::Todo("Yield")),
-            ExprKind::YieldFrom { value: _ } => Err(ParseError::Todo("YieldFrom")),
-            ExprKind::Compare { left, ops, comparators } => Ok(ExprLoc::new(
+            AstExpr::UnaryOp(_) => Err(ParseError::Todo("UnaryOp")),
+            AstExpr::Lambda(_) => Err(ParseError::Todo("Lambda")),
+            AstExpr::If(_) => Err(ParseError::Todo("IfExp")),
+            AstExpr::Dict(_) => Err(ParseError::Todo("Dict")),
+            AstExpr::Set(_) => Err(ParseError::Todo("Set")),
+            AstExpr::ListComp(_) => Err(ParseError::Todo("ListComp")),
+            AstExpr::SetComp(_) => Err(ParseError::Todo("SetComp")),
+            AstExpr::DictComp(_) => Err(ParseError::Todo("DictComp")),
+            AstExpr::Generator(_) => Err(ParseError::Todo("GeneratorExp")),
+            AstExpr::Await(_) => Err(ParseError::Todo("Await")),
+            AstExpr::Yield(_) => Err(ParseError::Todo("Yield")),
+            AstExpr::YieldFrom(_) => Err(ParseError::Todo("YieldFrom")),
+            AstExpr::Compare(ast::ExprCompare {
+                left,
+                ops,
+                comparators,
+                range,
+                ..
+            }) => Ok(ExprLoc::new(
                 self.convert_range(range),
                 Expr::CmpOp {
                     left: Box::new(self.parse_expression(*left)?),
-                    op: convert_compare_op(first(ops)?),
-                    right: Box::new(self.parse_expression(first(comparators)?)?),
+                    op: convert_compare_op(first(ops.into_vec())?),
+                    right: Box::new(self.parse_expression(first(comparators.into_vec())?)?),
                 },
             )),
-            ExprKind::Call { func, args, keywords } => {
+            AstExpr::Call(ast::ExprCall {
+                func, arguments, range, ..
+            }) => {
+                let ast::Arguments { args, keywords, .. } = arguments;
                 let args = args
+                    .into_vec()
                     .into_iter()
                     .map(|f| self.parse_expression(f))
                     .collect::<ParseResult<_>>()?;
                 let kwargs = keywords
+                    .into_vec()
                     .into_iter()
                     .map(|f| self.parse_kwargs(f))
                     .collect::<ParseResult<_>>()?;
                 let position = self.convert_range(range);
-                match func.node {
-                    ExprKind::Name { id, .. } => {
-                        let func = Identifier::from_name(id, self.convert_range(func.range));
+                match *func {
+                    AstExpr::Name(ast::ExprName { id, range, .. }) => {
+                        let func = Identifier::from_name(id.to_string(), self.convert_range(range));
                         let func = Function::Ident(func);
                         Ok(ExprLoc::new(position, Expr::Call { func, args, kwargs }))
                     }
-                    ExprKind::Attribute { value, attr, ctx: _ } => {
+                    AstExpr::Attribute(ast::ExprAttribute { value, attr, .. }) => {
                         let object = self.parse_identifier(*value)?;
                         Ok(ExprLoc::new(
                             position,
                             Expr::AttrCall {
                                 object,
-                                attr: attr.into(),
+                                attr: attr.id().to_string().into(),
                                 args,
                                 kwargs,
                             },
                         ))
                     }
-                    _ => Err(ParseError::Internal(
-                        format!("Expected name or attribute, got {:?}", func.node).into(),
+                    other => Err(ParseError::Internal(
+                        format!("Expected name or attribute, got {other:?}").into(),
                     )),
                 }
             }
-            ExprKind::FormattedValue {
-                value: _,
-                conversion: _,
-                format_spec: _,
-            } => Err(ParseError::Todo("FormattedValue")),
-            ExprKind::JoinedStr { values: _ } => Err(ParseError::Todo("JoinedStr")),
-            ExprKind::Constant { value, .. } => convert_const(value, self.convert_range(range)),
-            ExprKind::Attribute {
-                value: _,
-                attr: _,
-                ctx: _,
-            } => Err(ParseError::Todo("Attribute")),
-            ExprKind::Subscript {
-                value: _,
-                slice: _,
-                ctx: _,
-            } => Err(ParseError::Todo("Subscript")),
-            ExprKind::Starred { value: _, ctx: _ } => Err(ParseError::Todo("Starred")),
-            ExprKind::Name { id, .. } => Ok(ExprLoc::new(
+            AstExpr::FString(_) => Err(ParseError::Todo("FormattedValue")),
+            AstExpr::TString(_) => Err(ParseError::Todo("FormattedValue")),
+            AstExpr::StringLiteral(ast::ExprStringLiteral { value, range, .. }) => Ok(ExprLoc::new(
                 self.convert_range(range),
-                Expr::Name(Identifier::from_name(id, self.convert_range(expression.range))),
+                Expr::Constant(Const::Str(value.to_str().to_string())),
             )),
-            // TODO what is ctx here?
-            ExprKind::List { elts, ctx: _ } => {
+            AstExpr::BytesLiteral(ast::ExprBytesLiteral { value, range, .. }) => {
+                let bytes: Cow<'_, [u8]> = Cow::from(&value);
+                Ok(ExprLoc::new(
+                    self.convert_range(range),
+                    Expr::Constant(Const::Bytes(bytes.into_owned())),
+                ))
+            }
+            AstExpr::NumberLiteral(ast::ExprNumberLiteral { value, range, .. }) => {
+                let const_value = match value {
+                    Number::Int(i) => match i.as_i64() {
+                        Some(i) => Const::Int(i),
+                        None => return Err(ParseError::Todo("BigInt Support")),
+                    },
+                    Number::Float(f) => Const::Float(f),
+                    Number::Complex { .. } => return Err(ParseError::Todo("complex constants")),
+                };
+                Ok(ExprLoc::new(self.convert_range(range), Expr::Constant(const_value)))
+            }
+            AstExpr::BooleanLiteral(ast::ExprBooleanLiteral { value, range, .. }) => Ok(ExprLoc::new(
+                self.convert_range(range),
+                Expr::Constant(Const::Bool(value)),
+            )),
+            AstExpr::NoneLiteral(ast::ExprNoneLiteral { range, .. }) => {
+                Ok(ExprLoc::new(self.convert_range(range), Expr::Constant(Const::None)))
+            }
+            AstExpr::EllipsisLiteral(ast::ExprEllipsisLiteral { range, .. }) => {
+                Ok(ExprLoc::new(self.convert_range(range), Expr::Constant(Const::Ellipsis)))
+            }
+            AstExpr::Attribute(_) => Err(ParseError::Todo("Attribute")),
+            AstExpr::Subscript(_) => Err(ParseError::Todo("Subscript")),
+            AstExpr::Starred(_) => Err(ParseError::Todo("Starred")),
+            AstExpr::Name(ast::ExprName { id, range, .. }) => Ok(ExprLoc::new(
+                self.convert_range(range),
+                Expr::Name(Identifier::from_name(id.to_string(), self.convert_range(range))),
+            )),
+            AstExpr::List(ast::ExprList { elts, range, .. }) => {
                 let items = elts
                     .into_iter()
                     .map(|f| self.parse_expression(f))
@@ -296,7 +311,7 @@ impl<'c> Parser<'c> {
 
                 Ok(ExprLoc::new(self.convert_range(range), Expr::List(items)))
             }
-            ExprKind::Tuple { elts, ctx: _ } => {
+            AstExpr::Tuple(ast::ExprTuple { elts, range, .. }) => {
                 let items = elts
                     .into_iter()
                     .map(|f| self.parse_expression(f))
@@ -304,30 +319,31 @@ impl<'c> Parser<'c> {
 
                 Ok(ExprLoc::new(self.convert_range(range), Expr::Tuple(items)))
             }
-            ExprKind::Slice {
-                lower: _,
-                upper: _,
-                step: _,
-            } => Err(ParseError::Todo("Slice")),
+            AstExpr::Slice(_) => Err(ParseError::Todo("Slice")),
+            AstExpr::IpyEscapeCommand(_) => Err(ParseError::Todo("IpyEscapeCommand")),
         }
     }
 
     fn parse_kwargs(&self, kwarg: Keyword) -> ParseResult<'c, Kwarg<'c>> {
-        let key = match kwarg.node.arg {
-            Some(key) => Identifier::from_name(key, self.convert_range(kwarg.range)),
+        let key = match kwarg.arg {
+            Some(key) => self.identifier_from_node(key),
             None => return Err(ParseError::Todo("kwargs with no key")),
         };
-        let value = self.parse_expression(kwarg.node.value)?;
+        let value = self.parse_expression(kwarg.value)?;
         Ok(Kwarg { key, value })
     }
 
     fn parse_identifier(&self, ast: AstExpr) -> ParseResult<'c, Identifier<'c>> {
-        match ast.node {
-            ExprKind::Name { id, .. } => Ok(Identifier::from_name(id, self.convert_range(ast.range))),
-            _ => Err(ParseError::Internal(
-                format!("Expected name, got {:?}", ast.node).into(),
-            )),
+        match ast {
+            AstExpr::Name(ast::ExprName { id, range, .. }) => {
+                Ok(Identifier::from_name(id.to_string(), self.convert_range(range)))
+            }
+            other => Err(ParseError::Internal(format!("Expected name, got {other:?}").into())),
         }
+    }
+
+    fn identifier_from_node(&self, identifier: ast::Identifier) -> Identifier<'c> {
+        Identifier::from_name(identifier.id.to_string(), self.convert_range(identifier.range))
     }
 
     fn convert_range(&self, range: TextRange) -> CodeRange<'c> {
@@ -394,51 +410,26 @@ fn convert_op(op: AstOperator) -> Operator {
     }
 }
 
-fn convert_bool_op(op: Boolop) -> Operator {
+fn convert_bool_op(op: BoolOp) -> Operator {
     match op {
-        Boolop::And => Operator::And,
-        Boolop::Or => Operator::Or,
+        BoolOp::And => Operator::And,
+        BoolOp::Or => Operator::Or,
     }
 }
 
-fn convert_compare_op(op: Cmpop) -> CmpOperator {
+fn convert_compare_op(op: CmpOp) -> CmpOperator {
     match op {
-        Cmpop::Eq => CmpOperator::Eq,
-        Cmpop::NotEq => CmpOperator::NotEq,
-        Cmpop::Lt => CmpOperator::Lt,
-        Cmpop::LtE => CmpOperator::LtE,
-        Cmpop::Gt => CmpOperator::Gt,
-        Cmpop::GtE => CmpOperator::GtE,
-        Cmpop::Is => CmpOperator::Is,
-        Cmpop::IsNot => CmpOperator::IsNot,
-        Cmpop::In => CmpOperator::In,
-        Cmpop::NotIn => CmpOperator::NotIn,
+        CmpOp::Eq => CmpOperator::Eq,
+        CmpOp::NotEq => CmpOperator::NotEq,
+        CmpOp::Lt => CmpOperator::Lt,
+        CmpOp::LtE => CmpOperator::LtE,
+        CmpOp::Gt => CmpOperator::Gt,
+        CmpOp::GtE => CmpOperator::GtE,
+        CmpOp::Is => CmpOperator::Is,
+        CmpOp::IsNot => CmpOperator::IsNot,
+        CmpOp::In => CmpOperator::In,
+        CmpOp::NotIn => CmpOperator::NotIn,
     }
-}
-
-fn convert_const(c: Constant, range: CodeRange<'_>) -> ParseResult<'static, ExprLoc<'_>> {
-    let const_value = match c {
-        Constant::None => Const::None,
-        Constant::Bool(b) => Const::Bool(b),
-        Constant::Str(s) => Const::Str(s),
-        Constant::Bytes(b) => Const::Bytes(b),
-        Constant::Int(big_int) => match big_int.to_i64() {
-            Some(i) => Const::Int(i),
-            None => return Err(ParseError::Todo("BigInt Support")),
-        },
-        Constant::Tuple(tuple) => {
-            // unlike other variants of Constant, we store Tuples directly as expressions, not with Const
-            let items = tuple
-                .into_iter()
-                .map(|el| convert_const(el, range))
-                .collect::<ParseResult<_>>()?;
-            return Ok(ExprLoc::new(range, Expr::Tuple(items)));
-        }
-        Constant::Float(f) => Const::Float(f),
-        Constant::Complex { .. } => return Err(ParseError::Todo("complex constants")),
-        Constant::Ellipsis => Const::Ellipsis,
-    };
-    Ok(ExprLoc::new(range, Expr::Constant(const_value)))
 }
 
 #[derive(Debug, Clone, Copy)]

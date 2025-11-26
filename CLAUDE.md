@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Monty is a sandboxed Python interpreter written in Rust. It parses Python code using RustPython's parser but implements its own runtime execution model for safety and performance. This is a work-in-progress project that currently supports a subset of Python features.
+Monty is a sandboxed Python interpreter written in Rust. It parses Python code using Ruff's `ruff_python_parser` but implements its own runtime execution model for safety and performance. This is a work-in-progress project that currently supports a subset of Python features.
 
 Project goals:
 
