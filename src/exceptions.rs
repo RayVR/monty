@@ -27,6 +27,7 @@ pub enum ExcType {
     NameError,
     AttributeError,
     KeyError,
+    IndexError,
 }
 
 impl ExcType {
@@ -127,6 +128,30 @@ impl ExcType {
     pub fn type_error_at_most<'c>(name: &str, max: usize, actual: usize) -> RunError<'c> {
         // CPython: "get expected at most 2 arguments, got 3"
         exc_fmt!(Self::TypeError; "{} expected at most {} arguments, got {}", name, max, actual).into()
+    }
+
+    /// Creates an IndexError for list index out of range.
+    ///
+    /// Matches CPython's format: `IndexError('list index out of range')`
+    #[must_use]
+    pub fn list_index_error<'c>() -> RunError<'c> {
+        exc_static!(Self::IndexError; "list index out of range").into()
+    }
+
+    /// Creates an IndexError for tuple index out of range.
+    ///
+    /// Matches CPython's format: `IndexError('tuple index out of range')`
+    #[must_use]
+    pub fn tuple_index_error<'c>() -> RunError<'c> {
+        exc_static!(Self::IndexError; "tuple index out of range").into()
+    }
+
+    /// Creates a TypeError for non-integer sequence indices.
+    ///
+    /// Matches CPython's format: `TypeError('{type}' indices must be integers, not '{index_type}')`
+    #[must_use]
+    pub fn type_error_indices<'c>(type_str: &str, index_type: &str) -> RunError<'c> {
+        exc_fmt!(Self::TypeError; "{} indices must be integers, not '{}'", type_str, index_type).into()
     }
 }
 

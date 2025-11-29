@@ -119,6 +119,26 @@ impl PyValue for List {
         Some(self.0.len())
     }
 
+    fn py_getitem(&self, key: &Object, heap: &mut Heap) -> RunResult<'static, Object> {
+        // Extract integer index from key, returning TypeError if not an int
+        let index = match key {
+            Object::Int(i) => *i,
+            _ => return Err(ExcType::type_error_indices("list", key.py_type(heap))),
+        };
+
+        // Convert to usize, handling negative indices (Python-style: -1 = last element)
+        let len = self.0.len() as i64;
+        let normalized_index = if index < 0 { index + len } else { index };
+
+        // Bounds check
+        if normalized_index < 0 || normalized_index >= len {
+            return Err(ExcType::list_index_error());
+        }
+
+        // Return clone of the item with proper refcount increment
+        Ok(self.0[normalized_index as usize].clone_with_heap(heap))
+    }
+
     fn py_eq(&self, other: &Self, heap: &Heap) -> bool {
         self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(|(i1, i2)| i1.py_eq(i2, heap))
     }

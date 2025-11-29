@@ -47,7 +47,6 @@ fn add_two_cpython(bench: &mut Bencher) {
     });
 }
 
-/// Benchmarks adding two numbers using Monty interpreter
 fn dict_set_get_monty(bench: &mut Bencher) {
     let mut ex = Executor::new(
         "
@@ -71,7 +70,6 @@ a['key']
     });
 }
 
-/// Benchmarks adding two numbers using CPython
 fn dict_set_get_cpython(bench: &mut Bencher) {
     Python::with_gil(|py| {
         let fun: PyObject = PyModule::from_code(
@@ -80,6 +78,59 @@ fn dict_set_get_cpython(bench: &mut Bencher) {
                 a = {}
                 a['key'] = 'value'
                 return a['key']
+            ",
+            "test.py",
+            "main",
+        )
+        .unwrap()
+        .getattr("main")
+        .unwrap()
+        .into();
+
+        let r = fun.call0(py).unwrap();
+        let r: String = r.extract(py).unwrap();
+        assert_eq!(r, "value");
+
+        bench.iter(|| {
+            let r_py = fun.call0(py).unwrap();
+            let r: String = r_py.extract(py).unwrap();
+            black_box(r);
+        });
+    });
+}
+
+fn list_append_monty(bench: &mut Bencher) {
+    let mut ex = Executor::new(
+        "
+a = []
+a.append('value')
+a[0]
+        ",
+        "test.py",
+        &[],
+    )
+    .unwrap();
+
+    let r = ex.run(vec![]).unwrap();
+    let value: String = (&r.value().unwrap()).try_into().unwrap();
+    assert_eq!(value, "value");
+
+    bench.iter(|| {
+        let r = ex.run(vec![]).unwrap();
+        let value: String = (&r.value().unwrap()).try_into().unwrap();
+        black_box(value);
+    });
+}
+
+/// Benchmarks adding two numbers using CPython
+fn list_append_cpython(bench: &mut Bencher) {
+    Python::with_gil(|py| {
+        let fun: PyObject = PyModule::from_code(
+            py,
+            "def main():
+                a = []
+                a.append('value')
+                return a[0]
             ",
             "test.py",
             "main",
@@ -193,6 +244,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("dict_set_get");
     group.bench_function("monty", dict_set_get_monty);
     group.bench_function("cpython", dict_set_get_cpython);
+    group.finish();
+
+    let mut group = c.benchmark_group("list_append");
+    group.bench_function("monty", list_append_monty);
+    group.bench_function("cpython", list_append_cpython);
     group.finish();
 
     let mut group = c.benchmark_group("loop_mod_13");
