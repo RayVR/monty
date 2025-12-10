@@ -1,5 +1,7 @@
-use std::{borrow::Cow, fmt};
+use std::borrow::Cow;
+use std::fmt;
 
+use ruff_python_ast::name::Name;
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ConversionFlag as RuffConversionFlag, ElifElseClause, Expr as AstExpr,
     InterpolatedStringElement, Keyword, Number, Operator as AstOperator, Stmt, UnaryOp,
@@ -13,6 +15,7 @@ use crate::callable::Callable;
 use crate::exceptions::ExcType;
 use crate::expressions::{Expr, ExprLoc, Identifier, Literal};
 use crate::fstring::{ConversionFlag, FStringPart, FormatSpec};
+use crate::intern::{InternerBuilder, StringId};
 use crate::operators::{CmpOperator, Operator};
 use crate::parse_error::ParseError;
 
@@ -21,63 +24,75 @@ use crate::parse_error::ParseError;
 /// These nodes are created during parsing and then transformed during the prepare phase
 /// into `Node` variants with resolved names and scope information.
 #[derive(Debug, Clone)]
-pub(crate) enum ParseNode<'c> {
+pub enum ParseNode {
     Pass,
-    Expr(ExprLoc<'c>),
-    Return(ExprLoc<'c>),
+    Expr(ExprLoc),
+    Return(ExprLoc),
     ReturnNone,
-    Raise(Option<ExprLoc<'c>>),
+    Raise(Option<ExprLoc>),
     Assert {
-        test: ExprLoc<'c>,
-        msg: Option<ExprLoc<'c>>,
+        test: ExprLoc,
+        msg: Option<ExprLoc>,
     },
     Assign {
-        target: Identifier<'c>,
-        object: ExprLoc<'c>,
+        target: Identifier,
+        object: ExprLoc,
     },
     OpAssign {
-        target: Identifier<'c>,
+        target: Identifier,
         op: Operator,
-        object: ExprLoc<'c>,
+        object: ExprLoc,
     },
     SubscriptAssign {
-        target: Identifier<'c>,
-        index: ExprLoc<'c>,
-        value: ExprLoc<'c>,
+        target: Identifier,
+        index: ExprLoc,
+        value: ExprLoc,
     },
     For {
-        target: Identifier<'c>,
-        iter: ExprLoc<'c>,
-        body: Vec<ParseNode<'c>>,
-        or_else: Vec<ParseNode<'c>>,
+        target: Identifier,
+        iter: ExprLoc,
+        body: Vec<ParseNode>,
+        or_else: Vec<ParseNode>,
     },
     If {
-        test: ExprLoc<'c>,
-        body: Vec<ParseNode<'c>>,
-        or_else: Vec<ParseNode<'c>>,
+        test: ExprLoc,
+        body: Vec<ParseNode>,
+        or_else: Vec<ParseNode>,
     },
     FunctionDef {
-        name: Identifier<'c>,
-        params: Vec<&'c str>,
-        body: Vec<ParseNode<'c>>,
+        name: Identifier,
+        params: Vec<StringId>,
+        body: Vec<ParseNode>,
     },
     /// Global variable declaration.
     ///
     /// Declares that the listed names refer to module-level (global) variables,
     /// allowing functions to read and write them instead of creating local variables.
-    Global(Vec<&'c str>),
+    Global(Vec<StringId>),
     /// Nonlocal variable declaration.
     ///
     /// Declares that the listed names refer to variables in enclosing function scopes,
     /// allowing nested functions to read and write them instead of creating local variables.
-    Nonlocal(Vec<&'c str>),
+    Nonlocal(Vec<StringId>),
 }
 
-pub(crate) fn parse<'c>(code: &'c str, filename: &'c str) -> Result<Vec<ParseNode<'c>>, ParseError<'c>> {
+/// Result of parsing: the AST nodes and the string interner with all interned names.
+#[derive(Debug)]
+pub struct ParseResult {
+    pub nodes: Vec<ParseNode>,
+    pub interner: InternerBuilder,
+}
+
+pub(crate) fn parse(code: &str, filename: &str) -> Result<ParseResult, ParseError> {
     match parse_module(code) {
         Ok(parsed) => {
             let module = parsed.into_syntax();
-            Parser::new(code, filename).parse_statements(module.body)
+            let mut parser = Parser::new(code, filename);
+            let nodes = parser.parse_statements(module.body)?;
+            Ok(ParseResult {
+                nodes,
+                interner: parser.interner,
+            })
         }
         Err(e) => Err(syntax_error(e.to_string())),
     }
@@ -86,50 +101,60 @@ pub(crate) fn parse<'c>(code: &'c str, filename: &'c str) -> Result<Vec<ParseNod
 /// Creates a ParseError for an unimplemented Python feature.
 ///
 /// Returns a `ParseError::PreEvalExc` containing a `NotImplementedError` exception.
-fn not_implemented<'c>(feature: &str) -> ParseError<'c> {
+fn not_implemented(feature: &str) -> ParseError {
     use crate::exceptions::ExceptionRaise;
-    let exc: ExceptionRaise<'c> = ExcType::not_implemented(feature).into();
+    let exc: ExceptionRaise = ExcType::not_implemented(feature).into();
     exc.into()
 }
 
 /// Creates a ParseError for a syntax error.
 ///
 /// Returns a `ParseError::PreEvalExc` containing a `SyntaxError` exception.
-fn syntax_error<'c>(message: String) -> ParseError<'c> {
+fn syntax_error(message: String) -> ParseError {
     use crate::exceptions::{exc_fmt, ExceptionRaise, SimpleException};
-    let exc: SimpleException<'c> = exc_fmt!(ExcType::SyntaxError; "{}", message);
-    let raise: ExceptionRaise<'c> = exc.into();
+    let exc: SimpleException = exc_fmt!(ExcType::SyntaxError; "{}", message);
+    let raise: ExceptionRaise = exc.into();
     raise.into()
 }
 
-pub(crate) struct Parser<'c> {
+/// Parser for converting ruff AST to Monty's intermediate ParseNode representation.
+///
+/// Holds references to the source code and owns a string interner for names.
+/// The filename is interned once at construction and reused for all CodeRanges.
+pub struct Parser<'a> {
     line_ends: Vec<usize>,
-    code: &'c str,
-    filename: &'c str,
+    code: &'a str,
+    /// Interned filename ID, used for all CodeRanges created by this parser.
+    filename_id: StringId,
+    /// String interner for names (variables, functions, etc).
+    pub interner: InternerBuilder,
 }
 
-impl<'c> Parser<'c> {
-    fn new(code: &'c str, filename: &'c str) -> Self {
-        // position of each line in the source code, to convert indexes to line number and column number
+impl<'a> Parser<'a> {
+    fn new(code: &'a str, filename: &'a str) -> Self {
+        // Position of each line in the source code, to convert indexes to line number and column number
         let mut line_ends = vec![];
         for (i, c) in code.chars().enumerate() {
             if c == '\n' {
                 line_ends.push(i);
             }
         }
+        let mut interner = InternerBuilder::new();
+        let filename_id = interner.intern(filename);
         Self {
             line_ends,
             code,
-            filename,
+            filename_id,
+            interner,
         }
     }
 
-    fn parse_statements(&self, statements: Vec<Stmt>) -> Result<Vec<ParseNode<'c>>, ParseError<'c>> {
+    fn parse_statements(&mut self, statements: Vec<Stmt>) -> Result<Vec<ParseNode>, ParseError> {
         statements.into_iter().map(|f| self.parse_statement(f)).collect()
     }
 
-    fn parse_elif_else_clauses(&self, clauses: Vec<ElifElseClause>) -> Result<Vec<ParseNode<'c>>, ParseError<'c>> {
-        let mut tail: Vec<ParseNode<'c>> = Vec::new();
+    fn parse_elif_else_clauses(&mut self, clauses: Vec<ElifElseClause>) -> Result<Vec<ParseNode>, ParseError> {
+        let mut tail: Vec<ParseNode> = Vec::new();
         for clause in clauses.into_iter().rev() {
             match clause.test {
                 Some(test) => {
@@ -147,7 +172,7 @@ impl<'c> Parser<'c> {
         Ok(tail)
     }
 
-    fn parse_statement(&self, statement: Stmt) -> Result<ParseNode<'c>, ParseError<'c>> {
+    fn parse_statement(&mut self, statement: Stmt) -> Result<ParseNode, ParseError> {
         match statement {
             Stmt::FunctionDef(function) => {
                 if function.is_async {
@@ -172,10 +197,10 @@ impl<'c> Parser<'c> {
                     if param.default.is_some() {
                         return Err(not_implemented("default argument values"));
                     }
-                    params.push(&self.code[param.parameter.name.range]);
+                    params.push(self.interner.intern(&self.code[param.parameter.name.range]));
                 }
 
-                let name = self.identifier_from_range(function.name.range);
+                let name = self.identifier(function.name.id, function.name.range);
                 // Parse function body recursively
                 let body = self.parse_statements(function.body)?;
 
@@ -262,11 +287,17 @@ impl<'c> Parser<'c> {
             Stmt::Import(_) => Err(not_implemented("import statements")),
             Stmt::ImportFrom(_) => Err(not_implemented("from...import statements")),
             Stmt::Global(ast::StmtGlobal { names, .. }) => {
-                let names = names.iter().map(|id| &self.code[id.range]).collect();
+                let names = names
+                    .iter()
+                    .map(|id| self.interner.intern(&self.code[id.range]))
+                    .collect();
                 Ok(ParseNode::Global(names))
             }
             Stmt::Nonlocal(ast::StmtNonlocal { names, .. }) => {
-                let names = names.iter().map(|id| &self.code[id.range]).collect();
+                let names = names
+                    .iter()
+                    .map(|id| self.interner.intern(&self.code[id.range]))
+                    .collect();
                 Ok(ParseNode::Nonlocal(names))
             }
             Stmt::Expr(ast::StmtExpr { value, .. }) => Ok(ParseNode::Expr(self.parse_expression(*value)?)),
@@ -279,7 +310,7 @@ impl<'c> Parser<'c> {
 
     /// `lhs = rhs` -> `lhs, rhs`
     /// Handles both simple assignments (x = value) and subscript assignments (dict[key] = value)
-    fn parse_assignment(&self, lhs: AstExpr, rhs: AstExpr) -> Result<ParseNode<'c>, ParseError<'c>> {
+    fn parse_assignment(&mut self, lhs: AstExpr, rhs: AstExpr) -> Result<ParseNode, ParseError> {
         // Check if this is a subscript assignment like dict[key] = value
         if let AstExpr::Subscript(ast::ExprSubscript { value, slice, .. }) = lhs {
             Ok(ParseNode::SubscriptAssign {
@@ -296,7 +327,7 @@ impl<'c> Parser<'c> {
         }
     }
 
-    fn parse_expression(&self, expression: AstExpr) -> Result<ExprLoc<'c>, ParseError<'c>> {
+    fn parse_expression(&mut self, expression: AstExpr) -> Result<ExprLoc, ParseError> {
         match expression {
             AstExpr::BoolOp(ast::ExprBoolOp { op, values, range, .. }) => {
                 // Handle chained boolean operations like `a and b and c` by right-folding
@@ -408,12 +439,12 @@ impl<'c> Parser<'c> {
                     .into_vec()
                     .into_iter()
                     .map(|f| self.parse_expression(f))
-                    .collect::<Result<Vec<_>, ParseError<'c>>>()?;
+                    .collect::<Result<Vec<_>, ParseError>>()?;
                 let kwargs = keywords
                     .into_vec()
                     .into_iter()
                     .map(|f| self.parse_kwargs(f))
-                    .collect::<Result<Vec<_>, ParseError<'c>>>()?;
+                    .collect::<Result<Vec<_>, ParseError>>()?;
                 let args = ArgExprs::new(args, kwargs);
                 let position = self.convert_range(range);
                 match *func {
@@ -423,11 +454,9 @@ impl<'c> Parser<'c> {
                         // If neither, treat it as a name to be looked up at runtime.
                         let callable = if let Ok(builtin) = name.parse::<Builtins>() {
                             Callable::Builtin(builtin)
-                        } else if let Ok(exc_type) = name.parse::<ExcType>() {
-                            Callable::ExcType(exc_type)
                         } else {
                             // Name will be looked up in the namespace at runtime
-                            let ident = self.identifier_from_range(range);
+                            let ident = self.identifier(id, range);
                             Callable::Name(ident)
                         };
                         Ok(ExprLoc::new(position, Expr::Call { callable, args }))
@@ -449,16 +478,20 @@ impl<'c> Parser<'c> {
                 }
             }
             AstExpr::FString(ast::ExprFString { value, range, .. }) => self.parse_fstring(value, range),
-            AstExpr::TString(_) => Err(not_implemented("template strings (t-strings)")),
-            AstExpr::StringLiteral(ast::ExprStringLiteral { value, range, .. }) => Ok(ExprLoc::new(
-                self.convert_range(range),
-                Expr::Literal(Literal::Str(value.to_string())),
-            )),
-            AstExpr::BytesLiteral(ast::ExprBytesLiteral { value, range, .. }) => {
-                let bytes: Cow<'_, [u8]> = Cow::from(&value);
+            AstExpr::TString(_) => Err(not_implemented("template strings (t-interns)")),
+            AstExpr::StringLiteral(ast::ExprStringLiteral { value, range, .. }) => {
+                let string_id = self.interner.intern(&value.to_string());
                 Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::Literal(Literal::Bytes(bytes.into_owned())),
+                    Expr::Literal(Literal::Str(string_id)),
+                ))
+            }
+            AstExpr::BytesLiteral(ast::ExprBytesLiteral { value, range, .. }) => {
+                let bytes: Cow<'_, [u8]> = Cow::from(&value);
+                let bytes_id = self.interner.intern_bytes(&bytes);
+                Ok(ExprLoc::new(
+                    self.convert_range(range),
+                    Expr::Literal(Literal::Bytes(bytes_id)),
                 ))
             }
             AstExpr::NumberLiteral(ast::ExprNumberLiteral { value, range, .. }) => {
@@ -500,11 +533,9 @@ impl<'c> Parser<'c> {
                 let position = self.convert_range(range);
                 // Check if the name is a builtin function or exception type
                 let expr = if let Ok(builtin) = name.parse::<Builtins>() {
-                    Expr::Callable(Callable::Builtin(builtin))
-                } else if let Ok(exc_type) = name.parse::<ExcType>() {
-                    Expr::Callable(Callable::ExcType(exc_type))
+                    Expr::Builtin(builtin)
                 } else {
-                    Expr::Name(self.identifier_from_range(range))
+                    Expr::Name(self.identifier(id, range))
                 };
                 Ok(ExprLoc::new(position, expr))
             }
@@ -512,7 +543,7 @@ impl<'c> Parser<'c> {
                 let items = elts
                     .into_iter()
                     .map(|f| self.parse_expression(f))
-                    .collect::<Result<_, ParseError<'c>>>()?;
+                    .collect::<Result<_, ParseError>>()?;
 
                 Ok(ExprLoc::new(self.convert_range(range), Expr::List(items)))
             }
@@ -520,7 +551,7 @@ impl<'c> Parser<'c> {
                 let items = elts
                     .into_iter()
                     .map(|f| self.parse_expression(f))
-                    .collect::<Result<_, ParseError<'c>>>()?;
+                    .collect::<Result<_, ParseError>>()?;
 
                 Ok(ExprLoc::new(self.convert_range(range), Expr::Tuple(items)))
             }
@@ -529,24 +560,25 @@ impl<'c> Parser<'c> {
         }
     }
 
-    fn parse_kwargs(&self, kwarg: Keyword) -> Result<Kwarg<'c>, ParseError<'c>> {
+    fn parse_kwargs(&mut self, kwarg: Keyword) -> Result<Kwarg, ParseError> {
         let key = match kwarg.arg {
-            Some(key) => self.identifier_from_range(key.range),
+            Some(key) => self.identifier(key.id, key.range),
             None => return Err(not_implemented("keyword argument unpacking (**expr)")),
         };
         let value = self.parse_expression(kwarg.value)?;
         Ok(Kwarg { key, value })
     }
 
-    fn parse_identifier(&self, ast: AstExpr) -> Result<Identifier<'c>, ParseError<'c>> {
+    fn parse_identifier(&mut self, ast: AstExpr) -> Result<Identifier, ParseError> {
         match ast {
-            AstExpr::Name(ast::ExprName { range, .. }) => Ok(self.identifier_from_range(range)),
+            AstExpr::Name(ast::ExprName { id, range, .. }) => Ok(self.identifier(id, range)),
             other => Err(ParseError::Internal(format!("Expected name, got {other:?}").into())),
         }
     }
 
-    fn identifier_from_range(&self, range: TextRange) -> Identifier<'c> {
-        Identifier::new(&self.code[range], self.convert_range(range))
+    fn identifier(&mut self, id: Name, range: TextRange) -> Identifier {
+        let string_id = self.interner.intern(&id);
+        Identifier::new(string_id, self.convert_range(range))
     }
 
     /// Parses an f-string value into expression parts.
@@ -554,18 +586,16 @@ impl<'c> Parser<'c> {
     /// F-strings in ruff AST are represented as `FStringValue` containing
     /// `FStringPart`s, which can be either literal strings or `FString`
     /// interpolated sections. Each `FString` contains `InterpolatedStringElements`.
-    fn parse_fstring(&self, value: ast::FStringValue, range: TextRange) -> Result<ExprLoc<'c>, ParseError<'c>> {
+    fn parse_fstring(&mut self, value: ast::FStringValue, range: TextRange) -> Result<ExprLoc, ParseError> {
         let mut parts = Vec::new();
 
         for fstring_part in &value {
             match fstring_part {
                 ast::FStringPart::Literal(lit) => {
-                    // Literal string segment - use Cow to avoid allocation when possible
+                    // Literal string segment
                     let processed = lit.value.to_string();
                     if !processed.is_empty() {
-                        let raw = &self.code[lit.range];
-                        let s = if raw == processed { raw.into() } else { processed.into() };
-                        parts.push(FStringPart::Literal(s));
+                        parts.push(FStringPart::Literal(processed));
                     }
                 }
                 ast::FStringPart::FString(fstring) => {
@@ -581,9 +611,10 @@ impl<'c> Parser<'c> {
         // Optimization: if only one literal part, return as simple string literal
         if parts.len() == 1 {
             if let FStringPart::Literal(s) = &parts[0] {
+                let string_id = self.interner.intern(s);
                 return Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::Literal(Literal::Str(s.to_string())),
+                    Expr::Literal(Literal::Str(string_id)),
                 ));
             }
         }
@@ -592,14 +623,12 @@ impl<'c> Parser<'c> {
     }
 
     /// Parses a single f-string element (literal or interpolation).
-    fn parse_fstring_element(&self, element: &InterpolatedStringElement) -> Result<FStringPart<'c>, ParseError<'c>> {
+    fn parse_fstring_element(&mut self, element: &InterpolatedStringElement) -> Result<FStringPart, ParseError> {
         match element {
             InterpolatedStringElement::Literal(lit) => {
-                // Use Cow to avoid allocation when possible
+                // Convert to owned String
                 let processed = lit.value.to_string();
-                let raw = &self.code[lit.range];
-                let s = if raw == processed { raw.into() } else { processed.into() };
-                Ok(FStringPart::Literal(s))
+                Ok(FStringPart::Literal(processed))
             }
             InterpolatedStringElement::Interpolation(interp) => {
                 let expr = Box::new(self.parse_expression((*interp.expression).clone())?);
@@ -621,18 +650,16 @@ impl<'c> Parser<'c> {
     ///
     /// For static specs (no interpolations), parses the format string into a
     /// `ParsedFormatSpec` at parse time to avoid runtime parsing overhead.
-    fn parse_format_spec(&self, spec: &ast::InterpolatedStringFormatSpec) -> Result<FormatSpec<'c>, ParseError<'c>> {
+    fn parse_format_spec(&mut self, spec: &ast::InterpolatedStringFormatSpec) -> Result<FormatSpec, ParseError> {
         let mut parts = Vec::new();
         let mut has_interpolation = false;
 
         for element in &spec.elements {
             match element {
                 InterpolatedStringElement::Literal(lit) => {
-                    // Use Cow to avoid allocation when possible
+                    // Convert to owned String
                     let processed = lit.value.to_string();
-                    let raw = &self.code[lit.range];
-                    let s = if raw == processed { raw.into() } else { processed.into() };
-                    parts.push(FStringPart::Literal(s));
+                    parts.push(FStringPart::Literal(processed));
                 }
                 InterpolatedStringElement::Interpolation(interp) => {
                     has_interpolation = true;
@@ -654,13 +681,7 @@ impl<'c> Parser<'c> {
             // Combine all literal parts into a single static string and parse at parse time
             let static_spec: String = parts
                 .into_iter()
-                .filter_map(|p| {
-                    if let FStringPart::Literal(s) = p {
-                        Some(s.into_owned())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|p| if let FStringPart::Literal(s) = p { Some(s) } else { None })
                 .collect();
             let parsed = static_spec
                 .parse()
@@ -669,26 +690,23 @@ impl<'c> Parser<'c> {
         }
     }
 
-    fn convert_range(&self, range: TextRange) -> CodeRange<'c> {
+    fn convert_range(&self, range: TextRange) -> CodeRange {
         let start = range.start().into();
-        let (start_line_no, start_line_start, start_line_end) = self.index_to_position(start);
+        let (start_line_no, start_line_start, _) = self.index_to_position(start);
         let start = CodeLoc::new(start_line_no, start - start_line_start + 1);
 
         let end = range.end().into();
         let (end_line_no, end_line_start, _) = self.index_to_position(end);
         let end = CodeLoc::new(end_line_no, end - end_line_start + 1);
 
+        // Store line number for single-line ranges, None for multi-line
         let preview_line = if start_line_no == end_line_no {
-            if let Some(start_line_end) = start_line_end {
-                Some(&self.code[start_line_start..start_line_end])
-            } else {
-                Some(&self.code[start_line_start..])
-            }
+            Some(start_line_no as u32)
         } else {
             None
         };
 
-        CodeRange::new(self.filename, start, end, preview_line)
+        CodeRange::new(self.filename_id, start, end, preview_line)
     }
 
     fn index_to_position(&self, index: usize) -> (usize, usize, Option<usize>) {
@@ -703,7 +721,7 @@ impl<'c> Parser<'c> {
     }
 }
 
-fn first<T: fmt::Debug>(v: Vec<T>) -> Result<T, ParseError<'static>> {
+fn first<T: fmt::Debug>(v: Vec<T>) -> Result<T, ParseError> {
     if v.len() == 1 {
         v.into_iter()
             .next()
@@ -765,22 +783,30 @@ fn convert_conversion_flag(flag: RuffConversionFlag) -> ConversionFlag {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CodeRange<'c> {
-    filename: &'c str,
-    preview_line: Option<&'c str>,
+/// Source code location information for error reporting.
+///
+/// Contains filename (as StringId), line/column positions, and optionally a line number for
+/// extracting the preview line from source during traceback formatting.
+///
+/// To display the filename, the caller must provide access to the string storage.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CodeRange {
+    /// Interned filename ID - look up in Interns to get the actual string.
+    pub filename: StringId,
+    /// Line number (0-indexed) for extracting preview from source. None if range spans multiple lines.
+    preview_line: Option<u32>,
     start: CodeLoc,
     end: CodeLoc,
 }
 
-impl fmt::Display for CodeRange<'_> {
+impl fmt::Display for CodeRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} to {}", self.start, self.end)
     }
 }
 
-impl<'c> CodeRange<'c> {
-    fn new(filename: &'c str, start: CodeLoc, end: CodeLoc, preview_line: Option<&'c str>) -> Self {
+impl CodeRange {
+    fn new(filename: StringId, start: CodeLoc, end: CodeLoc, preview_line: Option<u32>) -> Self {
         Self {
             filename,
             preview_line,
@@ -789,7 +815,7 @@ impl<'c> CodeRange<'c> {
         }
     }
 
-    pub fn extend(&self, end: &CodeRange<'c>) -> Self {
+    pub fn extend(&self, end: &CodeRange) -> Self {
         Self {
             filename: self.filename,
             preview_line: if self.start.line == end.end.line {
@@ -802,32 +828,47 @@ impl<'c> CodeRange<'c> {
         }
     }
 
-    pub fn traceback(&self, f: &mut fmt::Formatter<'_>, frame_name: Option<&str>) -> fmt::Result {
+    /// Formats a traceback line for this code location.
+    ///
+    /// # Arguments
+    /// * `f` - The formatter to write to
+    /// * `frame_name` - The function name (or None for module-level)
+    /// * `source` - The original source code string for extracting preview lines
+    /// * `filename` - The filename string (looked up from StringId externally)
+    pub fn traceback(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        frame_name: Option<&str>,
+        source: &str,
+        filename: &str,
+    ) -> fmt::Result {
         if let Some(frame_name) = frame_name {
             writeln!(
                 f,
-                r#"  File "{}", line {}, in {frame_name}"#,
-                self.filename, self.start.line
+                r#"  File "{}", line {}, in {}"#,
+                filename, self.start.line, frame_name
             )?;
         } else {
             writeln!(
                 f,
                 r#"  File "{}", line {}, in <unknown frame>"#,
-                self.filename, self.start.line
+                filename, self.start.line
             )?;
         }
 
-        if let Some(line) = &self.preview_line {
-            writeln!(f, "    {line}")?;
-            f.write_str(&" ".repeat(4 - 1 + self.start.column as usize))?;
-            writeln!(f, "{}", "~".repeat((self.end.column - self.start.column) as usize))
-        } else {
-            Ok(())
+        if let Some(line_no) = self.preview_line {
+            // Extract the line from source by line number
+            if let Some(line) = source.lines().nth(line_no as usize) {
+                writeln!(f, "    {line}")?;
+                f.write_str(&" ".repeat(4 - 1 + self.start.column as usize))?;
+                writeln!(f, "{}", "~".repeat((self.end.column - self.start.column) as usize))?;
+            }
         }
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct CodeLoc {
     line: u32,
     column: u32,

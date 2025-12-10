@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -8,6 +7,7 @@ use ahash::AHashSet;
 
 use crate::args::ArgValues;
 use crate::exceptions::ExcType;
+use crate::intern::{FunctionId, Interns};
 use crate::resource::{ResourceError, ResourceTracker};
 use crate::run::RunResult;
 use crate::value::{Attr, Value};
@@ -15,7 +15,16 @@ use crate::values::PyTrait;
 use crate::values::{Bytes, Dict, List, Str, Tuple};
 
 /// Unique identifier for values stored inside the heap arena.
-pub type HeapId = usize;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HeapId(usize);
+
+impl HeapId {
+    /// Returns the raw index value.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
 
 /// HeapData captures every runtime value that must live in the arena.
 ///
@@ -26,23 +35,28 @@ pub type HeapId = usize;
 /// Note: The `Value` variant is special - it wraps boxed immediate values
 /// that need heap identity (e.g., when `id()` is called on an int).
 #[derive(Debug)]
-pub enum HeapData<'c, 'e> {
+pub enum HeapData {
     Str(Str),
     Bytes(Bytes),
-    List(List<'c, 'e>),
-    Tuple(Tuple<'c, 'e>),
-    Dict(Dict<'c, 'e>),
+    List(List),
+    Tuple(Tuple),
+    Dict(Dict),
+    /// A closure: a function that captures variables from enclosing scopes.
+    ///
+    /// Contains a reference to the function definition and a vector of captured cell HeapIds.
+    /// When the closure is called, these cells are passed to the RunFrame for variable access.
+    /// When the closure is dropped, we must decrement the ref count on each captured cell.
+    Closure(FunctionId, Vec<HeapId>),
     /// A cell wrapping a single mutable value for closure support.
     ///
     /// Cells enable nonlocal variable access by providing a heap-allocated
     /// container that can be shared between a function and its nested functions.
     /// Both the outer function and inner function hold references to the same
     /// cell, allowing modifications to propagate across scope boundaries.
-    Cell(Value<'c, 'e>),
-    // TODO: support arbitrary classes
+    Cell(Value),
 }
 
-impl<'c, 'e> HeapData<'c, 'e> {
+impl HeapData {
     /// Computes hash for immutable heap types that can be used as dict keys.
     ///
     /// Returns Some(hash) for immutable types (Str, Bytes, Tuple of hashables).
@@ -50,7 +64,7 @@ impl<'c, 'e> HeapData<'c, 'e> {
     ///
     /// This is called lazily when the value is first used as a dict key,
     /// avoiding unnecessary hash computation for values that are never used as keys.
-    fn compute_hash_if_immutable<T: ResourceTracker>(&self, heap: &mut Heap<'c, 'e, T>) -> Option<u64> {
+    fn compute_hash_if_immutable<T: ResourceTracker>(&self, heap: &mut Heap<T>, interns: &Interns) -> Option<u64> {
         match self {
             Self::Str(s) => {
                 let mut hasher = DefaultHasher::new();
@@ -66,11 +80,17 @@ impl<'c, 'e> HeapData<'c, 'e> {
                 // Tuple is hashable only if all elements are hashable
                 let mut hasher = DefaultHasher::new();
                 for obj in t.as_vec() {
-                    match obj.py_hash_u64(heap) {
+                    match obj.py_hash_u64(heap, interns) {
                         Some(h) => h.hash(&mut hasher),
                         None => return None, // Contains unhashable element
                     }
                 }
+                Some(hasher.finish())
+            }
+            Self::Closure(f, _) => {
+                let mut hasher = DefaultHasher::new();
+                // TODO, this is NOT proper hashing, we should somehow hash the function properly
+                f.hash(&mut hasher);
                 Some(hasher.finish())
             }
             // Mutable types cannot be hashed (Cell is handled specially in get_or_compute_hash)
@@ -83,14 +103,15 @@ impl<'c, 'e> HeapData<'c, 'e> {
 ///
 /// This provides efficient dispatch without boxing overhead by matching on
 /// the enum variant and delegating to the inner type's implementation.
-impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
-    fn py_type<T: ResourceTracker>(&self, heap: Option<&Heap<'c, 'e, T>>) -> &'static str {
+impl PyTrait for HeapData {
+    fn py_type<T: ResourceTracker>(&self, heap: Option<&Heap<T>>) -> &'static str {
         match self {
             Self::Str(s) => s.py_type(heap),
             Self::Bytes(b) => b.py_type(heap),
             Self::List(l) => l.py_type(heap),
             Self::Tuple(t) => t.py_type(heap),
             Self::Dict(d) => d.py_type(heap),
+            Self::Closure(_, _) => "function",
             Self::Cell(_) => "cell",
         }
     }
@@ -102,28 +123,31 @@ impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
             Self::List(l) => l.py_estimate_size(),
             Self::Tuple(t) => t.py_estimate_size(),
             Self::Dict(d) => d.py_estimate_size(),
+            // TODO is this right?
+            Self::Closure(_, _) => 0,
             Self::Cell(v) => std::mem::size_of::<Value>() + v.py_estimate_size(),
         }
     }
 
-    fn py_len<T: ResourceTracker>(&self, heap: &Heap<'c, 'e, T>) -> Option<usize> {
+    fn py_len<T: ResourceTracker>(&self, heap: &Heap<T>, interns: &Interns) -> Option<usize> {
         match self {
-            Self::Str(s) => PyTrait::py_len(s, heap),
-            Self::Bytes(b) => PyTrait::py_len(b, heap),
-            Self::List(l) => PyTrait::py_len(l, heap),
-            Self::Tuple(t) => PyTrait::py_len(t, heap),
-            Self::Dict(d) => PyTrait::py_len(d, heap),
-            Self::Cell(_) => None, // Cells don't have length
+            Self::Str(s) => PyTrait::py_len(s, heap, interns),
+            Self::Bytes(b) => PyTrait::py_len(b, heap, interns),
+            Self::List(l) => PyTrait::py_len(l, heap, interns),
+            Self::Tuple(t) => PyTrait::py_len(t, heap, interns),
+            Self::Dict(d) => PyTrait::py_len(d, heap, interns),
+            _ => None, // Cells don't have length
         }
     }
 
-    fn py_eq<T: ResourceTracker>(&self, other: &Self, heap: &mut Heap<'c, 'e, T>) -> bool {
+    fn py_eq<T: ResourceTracker>(&self, other: &Self, heap: &mut Heap<T>, interns: &Interns) -> bool {
         match (self, other) {
-            (Self::Str(a), Self::Str(b)) => a.py_eq(b, heap),
-            (Self::Bytes(a), Self::Bytes(b)) => a.py_eq(b, heap),
-            (Self::List(a), Self::List(b)) => a.py_eq(b, heap),
-            (Self::Tuple(a), Self::Tuple(b)) => a.py_eq(b, heap),
-            (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap),
+            (Self::Str(a), Self::Str(b)) => a.py_eq(b, heap, interns),
+            (Self::Bytes(a), Self::Bytes(b)) => a.py_eq(b, heap, interns),
+            (Self::List(a), Self::List(b)) => a.py_eq(b, heap, interns),
+            (Self::Tuple(a), Self::Tuple(b)) => a.py_eq(b, heap, interns),
+            (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap, interns),
+            (Self::Closure(a_id, a_cells), Self::Closure(b_id, b_cells)) => *a_id == *b_id && a_cells == b_cells,
             // Cells compare by identity only (handled at Value level via HeapId comparison)
             (Self::Cell(_), Self::Cell(_)) => false,
             _ => false, // Different types are never equal
@@ -137,17 +161,19 @@ impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
             Self::List(l) => l.py_dec_ref_ids(stack),
             Self::Tuple(t) => t.py_dec_ref_ids(stack),
             Self::Dict(d) => d.py_dec_ref_ids(stack),
+            Self::Closure(_, _) => {}
             Self::Cell(v) => v.py_dec_ref_ids(stack),
         }
     }
 
-    fn py_bool<T: ResourceTracker>(&self, heap: &Heap<'c, 'e, T>) -> bool {
+    fn py_bool<T: ResourceTracker>(&self, heap: &Heap<T>, interns: &Interns) -> bool {
         match self {
-            Self::Str(s) => s.py_bool(heap),
-            Self::Bytes(b) => b.py_bool(heap),
-            Self::List(l) => l.py_bool(heap),
-            Self::Tuple(t) => t.py_bool(heap),
-            Self::Dict(d) => d.py_bool(heap),
+            Self::Str(s) => s.py_bool(heap, interns),
+            Self::Bytes(b) => b.py_bool(heap, interns),
+            Self::List(l) => l.py_bool(heap, interns),
+            Self::Tuple(t) => t.py_bool(heap, interns),
+            Self::Dict(d) => d.py_bool(heap, interns),
+            Self::Closure(_, _) => true,
             Self::Cell(_) => true, // Cells are always truthy
         }
     }
@@ -155,42 +181,35 @@ impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
     fn py_repr_fmt<W: Write, T: ResourceTracker>(
         &self,
         f: &mut W,
-        heap: &Heap<'c, 'e, T>,
-        heap_ids: &mut AHashSet<usize>,
+        heap: &Heap<T>,
+        heap_ids: &mut AHashSet<HeapId>,
+        interns: &Interns,
     ) -> std::fmt::Result {
         match self {
-            Self::Str(s) => s.py_repr_fmt(f, heap, heap_ids),
-            Self::Bytes(b) => b.py_repr_fmt(f, heap, heap_ids),
-            Self::List(l) => l.py_repr_fmt(f, heap, heap_ids),
-            Self::Tuple(t) => t.py_repr_fmt(f, heap, heap_ids),
-            Self::Dict(d) => d.py_repr_fmt(f, heap, heap_ids),
+            Self::Str(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Bytes(b) => b.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::List(l) => l.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Tuple(t) => t.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Dict(d) => d.py_repr_fmt(f, heap, heap_ids, interns),
+            Self::Closure(f_id, _) => interns.get_function(*f_id).py_repr_fmt(f, interns, 0),
             // Cell repr shows the contained value's type
             Self::Cell(v) => write!(f, "<cell: {} object>", v.py_type(Some(heap))),
         }
     }
-
-    fn py_str<T: ResourceTracker>(&self, heap: &Heap<'c, 'e, T>) -> Cow<'static, str> {
-        match self {
-            Self::Str(s) => s.py_str(heap),
-            Self::Bytes(b) => b.py_str(heap),
-            Self::List(l) => l.py_str(heap),
-            Self::Tuple(t) => t.py_str(heap),
-            Self::Dict(d) => d.py_str(heap),
-            Self::Cell(v) => format!("<cell: {} object>", v.py_type(Some(heap))).into(),
-        }
-    }
+    // py_str is always the same as py_repr which is the default impl
 
     fn py_add<T: ResourceTracker>(
         &self,
         other: &Self,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> Result<Option<Value<'c, 'e>>, crate::resource::ResourceError> {
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> Result<Option<Value>, crate::resource::ResourceError> {
         match (self, other) {
-            (Self::Str(a), Self::Str(b)) => a.py_add(b, heap),
-            (Self::Bytes(a), Self::Bytes(b)) => a.py_add(b, heap),
-            (Self::List(a), Self::List(b)) => a.py_add(b, heap),
-            (Self::Tuple(a), Self::Tuple(b)) => a.py_add(b, heap),
-            (Self::Dict(a), Self::Dict(b)) => a.py_add(b, heap),
+            (Self::Str(a), Self::Str(b)) => a.py_add(b, heap, interns),
+            (Self::Bytes(a), Self::Bytes(b)) => a.py_add(b, heap, interns),
+            (Self::List(a), Self::List(b)) => a.py_add(b, heap, interns),
+            (Self::Tuple(a), Self::Tuple(b)) => a.py_add(b, heap, interns),
+            (Self::Dict(a), Self::Dict(b)) => a.py_add(b, heap, interns),
             // Cells don't support arithmetic operations
             _ => Ok(None),
         }
@@ -199,8 +218,8 @@ impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
     fn py_sub<T: ResourceTracker>(
         &self,
         other: &Self,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> Result<Option<Value<'c, 'e>>, crate::resource::ResourceError> {
+        heap: &mut Heap<T>,
+    ) -> Result<Option<Value>, crate::resource::ResourceError> {
         match (self, other) {
             (Self::Str(a), Self::Str(b)) => a.py_sub(b, heap),
             (Self::Bytes(a), Self::Bytes(b)) => a.py_sub(b, heap),
@@ -212,7 +231,7 @@ impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
         }
     }
 
-    fn py_mod(&self, other: &Self) -> Option<Value<'c, 'e>> {
+    fn py_mod(&self, other: &Self) -> Option<Value> {
         match (self, other) {
             (Self::Str(a), Self::Str(b)) => a.py_mod(b),
             (Self::Bytes(a), Self::Bytes(b)) => a.py_mod(b),
@@ -238,64 +257,65 @@ impl<'c, 'e> PyTrait<'c, 'e> for HeapData<'c, 'e> {
 
     fn py_iadd<T: ResourceTracker>(
         &mut self,
-        other: Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
+        other: Value,
+        heap: &mut Heap<T>,
         self_id: Option<HeapId>,
+        interns: &Interns,
     ) -> Result<bool, crate::resource::ResourceError> {
         match self {
-            Self::Str(s) => s.py_iadd(other, heap, self_id),
-            Self::Bytes(b) => b.py_iadd(other, heap, self_id),
-            Self::List(l) => l.py_iadd(other, heap, self_id),
-            Self::Tuple(t) => t.py_iadd(other, heap, self_id),
-            Self::Dict(d) => d.py_iadd(other, heap, self_id),
-            Self::Cell(_) => Ok(false), // Cells don't support in-place add
+            Self::Str(s) => s.py_iadd(other, heap, self_id, interns),
+            Self::Bytes(b) => b.py_iadd(other, heap, self_id, interns),
+            Self::List(l) => l.py_iadd(other, heap, self_id, interns),
+            Self::Tuple(t) => t.py_iadd(other, heap, self_id, interns),
+            Self::Dict(d) => d.py_iadd(other, heap, self_id, interns),
+            _ => Ok(false),
         }
     }
 
     fn py_call_attr<T: ResourceTracker>(
         &mut self,
-        heap: &mut Heap<'c, 'e, T>,
+        heap: &mut Heap<T>,
         attr: &Attr,
-        args: ArgValues<'c, 'e>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+        args: ArgValues,
+        interns: &Interns,
+    ) -> RunResult<Value> {
         match self {
-            Self::Str(s) => s.py_call_attr(heap, attr, args),
-            Self::Bytes(b) => b.py_call_attr(heap, attr, args),
-            Self::List(l) => l.py_call_attr(heap, attr, args),
-            Self::Tuple(t) => t.py_call_attr(heap, attr, args),
-            Self::Dict(d) => d.py_call_attr(heap, attr, args),
-            Self::Cell(_) => Err(crate::exceptions::ExcType::attribute_error("cell", attr)),
+            Self::Str(s) => s.py_call_attr(heap, attr, args, interns),
+            Self::Bytes(b) => b.py_call_attr(heap, attr, args, interns),
+            Self::List(l) => l.py_call_attr(heap, attr, args, interns),
+            Self::Tuple(t) => t.py_call_attr(heap, attr, args, interns),
+            Self::Dict(d) => d.py_call_attr(heap, attr, args, interns),
+            _ => Err(ExcType::attribute_error(self.py_type(Some(heap)), attr)),
         }
     }
 
-    fn py_getitem<T: ResourceTracker>(
-        &self,
-        key: &Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+    fn py_getitem<T: ResourceTracker>(&self, key: &Value, heap: &mut Heap<T>, interns: &Interns) -> RunResult<Value> {
         match self {
-            Self::Str(s) => s.py_getitem(key, heap),
-            Self::Bytes(b) => b.py_getitem(key, heap),
-            Self::List(l) => l.py_getitem(key, heap),
-            Self::Tuple(t) => t.py_getitem(key, heap),
-            Self::Dict(d) => d.py_getitem(key, heap),
-            Self::Cell(_) => Err(crate::exceptions::ExcType::type_error_not_sub("cell")),
+            Self::Str(s) => s.py_getitem(key, heap, interns),
+            Self::Bytes(b) => b.py_getitem(key, heap, interns),
+            Self::List(l) => l.py_getitem(key, heap, interns),
+            Self::Tuple(t) => t.py_getitem(key, heap, interns),
+            Self::Dict(d) => d.py_getitem(key, heap, interns),
+            _ => Err(crate::exceptions::ExcType::type_error_not_sub(self.py_type(Some(heap)))),
         }
     }
 
     fn py_setitem<T: ResourceTracker>(
         &mut self,
-        key: Value<'c, 'e>,
-        value: Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, ()> {
+        key: Value,
+        value: Value,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<()> {
         match self {
-            Self::Str(s) => s.py_setitem(key, value, heap),
-            Self::Bytes(b) => b.py_setitem(key, value, heap),
-            Self::List(l) => l.py_setitem(key, value, heap),
-            Self::Tuple(t) => t.py_setitem(key, value, heap),
-            Self::Dict(d) => d.py_setitem(key, value, heap),
-            Self::Cell(_) => Err(crate::exceptions::ExcType::type_error_not_sub_assignment("cell")),
+            Self::Str(s) => s.py_setitem(key, value, heap, interns),
+            Self::Bytes(b) => b.py_setitem(key, value, heap, interns),
+            Self::List(l) => l.py_setitem(key, value, heap, interns),
+            Self::Tuple(t) => t.py_setitem(key, value, heap, interns),
+            Self::Dict(d) => d.py_setitem(key, value, heap, interns),
+            _ => Err(crate::exceptions::ExcType::type_error_not_sub_assignment(
+                self.py_type(Some(heap)),
+            )),
         }
     }
 }
@@ -312,10 +332,14 @@ enum HashState {
 }
 
 impl HashState {
-    fn for_data(data: &HeapData<'_, '_>) -> Self {
+    fn for_data(data: &HeapData) -> Self {
         match data {
             // Cells are hashable by identity (like all Python objects without __hash__ override)
-            HeapData::Str(_) | HeapData::Bytes(_) | HeapData::Tuple(_) | HeapData::Cell(_) => Self::Unknown,
+            HeapData::Str(_)
+            | HeapData::Bytes(_)
+            | HeapData::Tuple(_)
+            | HeapData::Cell(_)
+            | HeapData::Closure(_, _) => Self::Unknown,
             HeapData::List(_) | HeapData::Dict(_) => Self::Unhashable,
         }
     }
@@ -333,10 +357,10 @@ impl HashState {
 /// then restore the data. This avoids unsafe code while keeping `refcount` accessible
 /// for `inc_ref`/`dec_ref` during the borrow.
 #[derive(Debug)]
-struct HeapValue<'c, 'e> {
+struct HeapValue {
     refcount: usize,
     /// The payload data. Temporarily `None` while borrowed via `with_entry_mut`/`call_attr`.
-    data: Option<HeapData<'c, 'e>>,
+    data: Option<HeapData>,
     /// Current hashing status / cached hash value
     hash_state: HashState,
 }
@@ -351,8 +375,8 @@ struct HeapValue<'c, 'e> {
 /// Generic over `T: ResourceTracker` to support different resource tracking strategies.
 /// When `T = NoLimitTracker` (the default), all resource checks compile away to no-ops.
 #[derive(Debug)]
-pub struct Heap<'c, 'e, T: ResourceTracker> {
-    entries: Vec<Option<HeapValue<'c, 'e>>>,
+pub struct Heap<T: ResourceTracker> {
+    entries: Vec<Option<HeapValue>>,
     /// IDs of freed slots available for reuse. Populated by `dec_ref`, consumed by `allocate`.
     free_list: Vec<HeapId>,
     /// Resource tracker for enforcing limits and scheduling GC.
@@ -363,7 +387,7 @@ macro_rules! take_data {
     ($self:ident, $id:expr, $func_name:literal) => {
         $self
             .entries
-            .get_mut($id)
+            .get_mut($id.index())
             .expect(concat!("Heap::", $func_name, ": slot missing"))
             .as_mut()
             .expect(concat!("Heap::", $func_name, ": object already freed"))
@@ -377,7 +401,7 @@ macro_rules! restore_data {
     ($self:ident, $id:expr, $new_data:expr, $func_name:literal) => {{
         let entry = $self
             .entries
-            .get_mut($id)
+            .get_mut($id.index())
             .expect(concat!("Heap::", $func_name, ": slot missing"))
             .as_mut()
             .expect(concat!("Heap::", $func_name, ": object already freed"));
@@ -385,7 +409,7 @@ macro_rules! restore_data {
     }};
 }
 
-impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
+impl<T: ResourceTracker> Heap<T> {
     /// Creates a new heap with the given resource tracker.
     ///
     /// Use this to create heaps with custom resource limits or GC scheduling.
@@ -411,7 +435,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     ///
     /// Returns `Err(ResourceError)` if allocation would exceed configured limits.
     /// Use this when you need to handle resource limit errors gracefully.
-    pub fn allocate(&mut self, data: HeapData<'c, 'e>) -> Result<HeapId, ResourceError> {
+    pub fn allocate(&mut self, data: HeapData) -> Result<HeapId, ResourceError> {
         self.tracker.on_allocate(|| data.py_estimate_size())?;
 
         let hash_state = HashState::for_data(&data);
@@ -423,13 +447,13 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
 
         let id = if let Some(id) = self.free_list.pop() {
             // Reuse a freed slot
-            self.entries[id] = Some(new_entry);
+            self.entries[id.index()] = Some(new_entry);
             id
         } else {
             // No free slots, append new entry
             let id = self.entries.len();
             self.entries.push(Some(new_entry));
-            id
+            HeapId(id)
         };
 
         Ok(id)
@@ -443,7 +467,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// Note: The contained value's refcount is NOT incremented. The caller is
     /// responsible for ensuring proper reference counting of the value before
     /// putting it in a cell (typically by cloning with `clone_with_heap`).
-    pub fn alloc_cell(&mut self, value: Value<'c, 'e>) -> HeapId {
+    pub fn alloc_cell(&mut self, value: Value) -> HeapId {
         // Cell allocation is considered infallible - cells are small and essential
         // for closure support. Panic if allocation fails (should be rare).
         self.allocate(HeapData::Cell(value))
@@ -457,7 +481,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     pub fn inc_ref(&mut self, id: HeapId) {
         let value = self
             .entries
-            .get_mut(id)
+            .get_mut(id.index())
             .expect("Heap::inc_ref: slot missing")
             .as_mut()
             .expect("Heap::inc_ref: object already freed");
@@ -473,7 +497,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
     pub fn dec_ref(&mut self, id: HeapId) {
-        let slot = self.entries.get_mut(id).expect("Heap::dec_ref: slot missing");
+        let slot = self.entries.get_mut(id.index()).expect("Heap::dec_ref: slot missing");
         let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
         if entry.refcount > 1 {
             entry.refcount -= 1;
@@ -505,9 +529,9 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// Panics if the value ID is invalid, the value has already been freed,
     /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
     #[must_use]
-    pub fn get(&self, id: HeapId) -> &HeapData<'c, 'e> {
+    pub fn get(&self, id: HeapId) -> &HeapData {
         self.entries
-            .get(id)
+            .get(id.index())
             .expect("Heap::get: slot missing")
             .as_ref()
             .expect("Heap::get: object already freed")
@@ -521,9 +545,9 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// # Panics
     /// Panics if the value ID is invalid, the value has already been freed,
     /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
-    pub fn get_mut(&mut self, id: HeapId) -> &mut HeapData<'c, 'e> {
+    pub fn get_mut(&mut self, id: HeapId) -> &mut HeapData {
         self.entries
-            .get_mut(id)
+            .get_mut(id.index())
             .expect("Heap::get_mut: slot missing")
             .as_mut()
             .expect("Heap::get_mut: object already freed")
@@ -540,10 +564,10 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     ///
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
-    pub fn get_or_compute_hash(&mut self, id: HeapId) -> Option<u64> {
+    pub fn get_or_compute_hash(&mut self, id: HeapId, interns: &Interns) -> Option<u64> {
         let entry = self
             .entries
-            .get_mut(id)
+            .get_mut(id.index())
             .expect("Heap::get_or_compute_hash: slot missing")
             .as_mut()
             .expect("Heap::get_or_compute_hash: object already freed");
@@ -565,12 +589,12 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
 
         // Compute hash lazily - need to temporarily take data to avoid borrow conflict
         let data = entry.data.take().expect("Heap::get_or_compute_hash: data borrowed");
-        let hash = data.compute_hash_if_immutable(self);
+        let hash = data.compute_hash_if_immutable(self, interns);
 
         // Restore data and cache the hash if computed
         let entry = self
             .entries
-            .get_mut(id)
+            .get_mut(id.index())
             .expect("Heap::get_or_compute_hash: slot missing after compute")
             .as_mut()
             .expect("Heap::get_or_compute_hash: object freed during compute");
@@ -586,16 +610,16 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// of its payload so we can borrow the heap again inside the call. This avoids the
     /// borrow checker conflict that arises when attribute implementations also need
     /// mutable access to the heap (e.g. for refcounting).
-    pub fn call_attr(&mut self, id: HeapId, attr: &Attr, args: ArgValues<'c, 'e>) -> RunResult<'c, Value<'c, 'e>> {
+    pub fn call_attr(&mut self, id: HeapId, attr: &Attr, args: ArgValues, interns: &Interns) -> RunResult<Value> {
         // Take data out in a block so the borrow of self.entries ends
         let mut data = take_data!(self, id, "call_attr");
 
-        let result = data.py_call_attr(self, attr, args);
+        let result = data.py_call_attr(self, attr, args, interns);
 
         // Restore data
         let entry = self
             .entries
-            .get_mut(id)
+            .get_mut(id.index())
             .expect("Heap::call_attr: slot missing")
             .as_mut()
             .expect("Heap::call_attr: object already freed");
@@ -611,7 +635,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// The data is automatically restored after the closure completes.
     pub fn with_entry_mut<F, R>(&mut self, id: HeapId, f: F) -> R
     where
-        F: FnOnce(&mut Heap<'c, 'e, T>, &mut HeapData<'c, 'e>) -> R,
+        F: FnOnce(&mut Heap<T>, &mut HeapData) -> R,
     {
         // Take data out in a block so the borrow of self.entries ends
         let mut data = take_data!(self, id, "with_entry_mut");
@@ -629,7 +653,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// finishes executing.
     pub fn with_two<F, R>(&mut self, left: HeapId, right: HeapId, f: F) -> R
     where
-        F: FnOnce(&mut Heap<'c, 'e, T>, &HeapData<'c, 'e>, &HeapData<'c, 'e>) -> R,
+        F: FnOnce(&mut Heap<T>, &HeapData, &HeapData) -> R,
     {
         if left == right {
             // Same value - take data once and pass it twice
@@ -681,7 +705,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     #[must_use]
     pub fn get_refcount(&self, id: HeapId) -> usize {
         self.entries
-            .get(id)
+            .get(id.index())
             .expect("Heap::get_refcount: slot missing")
             .as_ref()
             .expect("Heap::get_refcount: object already freed")
@@ -704,7 +728,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     ///
     /// # Panics
     /// Panics if the ID is invalid, the value has been freed, or the entry is not a Cell.
-    pub fn get_cell_value(&mut self, id: HeapId) -> Value<'c, 'e> {
+    pub fn get_cell_value(&mut self, id: HeapId) -> Value {
         // Take the data out to avoid borrow conflicts when cloning
         let data = take_data!(self, id, "get_cell_value");
 
@@ -723,7 +747,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     ///
     /// # Panics
     /// Panics if the ID is invalid, the value has been freed, or the entry is not a Cell.
-    pub fn set_cell_value(&mut self, id: HeapId, value: Value<'c, 'e>) {
+    pub fn set_cell_value(&mut self, id: HeapId, value: Value) {
         // Take the data out to avoid borrow conflicts
         let mut data = take_data!(self, id, "set_cell_value");
 
@@ -745,7 +769,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     ///
     /// # Panics
     /// Panics if the ID is invalid, the value has been freed, or the entry is not a Cell.
-    pub fn get_cell_value_ref(&self, id: HeapId) -> &Value<'c, 'e> {
+    pub fn get_cell_value_ref(&self, id: HeapId) -> &Value {
         let data = self.get(id);
         match data {
             HeapData::Cell(v) => v,
@@ -761,13 +785,13 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// take/restore pattern to avoid the lifetime propagation issues.
     ///
     /// Returns `true` if successful, `false` if the source ID is not a List.
-    pub fn iadd_extend_list(&mut self, source_id: HeapId, dest: &mut Vec<Value<'c, 'e>>) -> bool {
+    pub fn iadd_extend_list(&mut self, source_id: HeapId, dest: &mut Vec<Value>) -> bool {
         // Take the source data temporarily
         let source_data = take_data!(self, source_id, "iadd_extend_list");
 
         let success = if let HeapData::List(list) = &source_data {
             // Copy items and track which refs need incrementing
-            let items: Vec<Value<'c, 'e>> = list.as_vec().iter().map(Value::copy_for_extend).collect();
+            let items: Vec<Value> = list.as_vec().iter().map(Value::copy_for_extend).collect();
             let ref_ids: Vec<HeapId> = items
                 .iter()
                 .filter_map(|obj| if let Value::Ref(id) = obj { Some(*id) } else { None })
@@ -807,30 +831,20 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     /// * `Ok(Some(Value))` - The new repeated sequence
     /// * `Ok(None)` - If the heap entry is not a sequence type
     /// * `Err` - If allocation fails due to resource limits
-    pub fn mult_sequence(&mut self, id: HeapId, count: usize) -> RunResult<'c, Option<Value<'c, 'e>>> {
+    pub fn mult_sequence(&mut self, id: HeapId, count: usize) -> RunResult<Option<Value>> {
         // Take the data out to avoid borrow conflicts
         let data = take_data!(self, id, "mult_sequence");
 
         let result = match &data {
             HeapData::Str(s) => {
-                if count == 0 {
-                    restore_data!(self, id, data, "mult_sequence");
-                    Ok(Some(Value::InternString("")))
-                } else {
-                    let repeated = s.as_str().repeat(count);
-                    restore_data!(self, id, data, "mult_sequence");
-                    Ok(Some(Value::Ref(self.allocate(HeapData::Str(repeated.into()))?)))
-                }
+                let repeated = s.as_str().repeat(count);
+                restore_data!(self, id, data, "mult_sequence");
+                Ok(Some(Value::Ref(self.allocate(HeapData::Str(repeated.into()))?)))
             }
             HeapData::Bytes(b) => {
-                if count == 0 {
-                    restore_data!(self, id, data, "mult_sequence");
-                    Ok(Some(Value::InternBytes(&[])))
-                } else {
-                    let repeated = b.as_slice().repeat(count);
-                    restore_data!(self, id, data, "mult_sequence");
-                    Ok(Some(Value::Ref(self.allocate(HeapData::Bytes(repeated.into()))?)))
-                }
+                let repeated = b.as_slice().repeat(count);
+                restore_data!(self, id, data, "mult_sequence");
+                Ok(Some(Value::Ref(self.allocate(HeapData::Bytes(repeated.into()))?)))
             }
             HeapData::List(list) => {
                 if count == 0 {
@@ -838,7 +852,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
                     Ok(Some(Value::Ref(self.allocate(HeapData::List(List::new(Vec::new())))?)))
                 } else {
                     // Copy items and track which refs need incrementing
-                    let items: Vec<Value<'c, 'e>> = list.as_vec().iter().map(Value::copy_for_extend).collect();
+                    let items: Vec<Value> = list.as_vec().iter().map(Value::copy_for_extend).collect();
                     let ref_ids: Vec<HeapId> = items
                         .iter()
                         .filter_map(|v| if let Value::Ref(id) = v { Some(*id) } else { None })
@@ -882,7 +896,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
                     )))
                 } else {
                     // Copy items and track which refs need incrementing
-                    let items: Vec<Value<'c, 'e>> = tuple.as_vec().iter().map(Value::copy_for_extend).collect();
+                    let items: Vec<Value> = tuple.as_vec().iter().map(Value::copy_for_extend).collect();
                     let ref_ids: Vec<HeapId> = items
                         .iter()
                         .filter_map(|v| if let Value::Ref(id) = v { Some(*id) } else { None })
@@ -919,8 +933,8 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
                     )))
                 }
             }
-            HeapData::Dict(_) | HeapData::Cell(_) => {
-                // Dicts and Cells don't support multiplication
+            _ => {
+                // Dicts, Cells, Callables, Functions and Closures don't support multiplication
                 restore_data!(self, id, data, "mult_sequence");
                 Ok(None)
             }
@@ -955,7 +969,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
             }
 
             // Add children to work list
-            if let Some(Some(entry)) = self.entries.get(id) {
+            if let Some(Some(entry)) = self.entries.get(id.index()) {
                 if let Some(ref data) = entry.data {
                     self.collect_child_ids(data, &mut work_list);
                 }
@@ -964,7 +978,8 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
 
         // Sweep phase: free unreachable values
         for (id, value) in self.entries.iter_mut().enumerate() {
-            if reachable.contains(&id) {
+            let heap_id = HeapId(id);
+            if reachable.contains(&heap_id) {
                 continue;
             }
 
@@ -975,7 +990,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
                     self.tracker.on_free(|| data.py_estimate_size());
                 }
 
-                self.free_list.push(id);
+                self.free_list.push(heap_id);
 
                 // Mark Values as Dereferenced when dec-ref-check is enabled
                 #[cfg(feature = "dec-ref-check")]
@@ -990,7 +1005,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
     }
 
     /// Collects child HeapIds from a HeapData value for GC traversal.
-    fn collect_child_ids(&self, data: &HeapData<'c, 'e>, work_list: &mut Vec<HeapId>) {
+    fn collect_child_ids(&self, data: &HeapData, work_list: &mut Vec<HeapId>) {
         match data {
             HeapData::Str(_) | HeapData::Bytes(_) => {}
             HeapData::List(list) => {
@@ -1020,6 +1035,12 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
                     }
                 }
             }
+            HeapData::Closure(_, children) => {
+                // Decrement ref count for each captured cell
+                for child_id in children {
+                    work_list.push(*child_id);
+                }
+            }
             HeapData::Cell(value) => {
                 // Cell can contain a reference to another heap value
                 if let Value::Ref(id) = value {
@@ -1033,7 +1054,7 @@ impl<'c, 'e, T: ResourceTracker> Heap<'c, 'e, T> {
 /// Drop implementation for Heap that marks all contained Objects as Dereferenced
 /// before dropping to prevent panics when the `dec-ref-check` feature is enabled.
 #[cfg(feature = "dec-ref-check")]
-impl<T: ResourceTracker> Drop for Heap<'_, '_, T> {
+impl<T: ResourceTracker> Drop for Heap<T> {
     fn drop(&mut self) {
         // Mark all contained Objects as Dereferenced before dropping.
         // We use py_dec_ref_ids for this since it handles the marking

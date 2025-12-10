@@ -9,18 +9,18 @@ use crate::resource::ResourceError;
 /// Most errors are represented as `PreEvalExc` containing a Python exception,
 /// allowing them to be displayed in Python's familiar exception format.
 #[derive(Debug, Clone)]
-pub enum ParseError<'c> {
+pub enum ParseError {
     /// Internal parsing error (should not occur in normal usage).
     Internal(Cow<'static, str>),
     /// A Python exception raised during parsing or preparation.
-    PreEvalExc(ExceptionRaise<'c>),
+    PreEvalExc(ExceptionRaise),
     /// Internal runtime error during preparation.
     PreEvalInternal(InternalRunError),
     /// Resource limit exceeded during preparation.
     PreEvalResource(ResourceError),
 }
 
-impl fmt::Display for ParseError<'_> {
+impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Internal(s) => write!(f, "Internal parsing error: {s}"),
@@ -31,8 +31,8 @@ impl fmt::Display for ParseError<'_> {
     }
 }
 
-impl<'c> From<RunError<'c>> for ParseError<'c> {
-    fn from(run_error: RunError<'c>) -> Self {
+impl From<RunError> for ParseError {
+    fn from(run_error: RunError) -> Self {
         match run_error {
             RunError::Exc(e) => Self::PreEvalExc(e),
             RunError::Internal(e) => Self::PreEvalInternal(e),
@@ -41,13 +41,13 @@ impl<'c> From<RunError<'c>> for ParseError<'c> {
     }
 }
 
-impl<'c> From<ExceptionRaise<'c>> for ParseError<'c> {
-    fn from(exc: ExceptionRaise<'c>) -> Self {
+impl From<ExceptionRaise> for ParseError {
+    fn from(exc: ExceptionRaise) -> Self {
         Self::PreEvalExc(exc)
     }
 }
 
-impl From<InternalRunError> for ParseError<'_> {
+impl From<InternalRunError> for ParseError {
     fn from(internal_run_error: InternalRunError) -> Self {
         Self::PreEvalInternal(internal_run_error)
     }

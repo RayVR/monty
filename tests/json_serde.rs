@@ -185,7 +185,7 @@ fn cycle_equality_same_id() {
             assert_eq!(inner1[0], inner2[0], "cycles referencing same object should be equal");
 
             // Verify they are actually Cycle variants
-            assert!(matches!(&inner1[0], PyObject::Cycle(_)));
+            assert!(matches!(&inner1[0], PyObject::Cycle(..)));
         } else {
             panic!("expected inner lists");
         }
@@ -217,7 +217,7 @@ fn cycle_equality_different_ids() {
             );
 
             // Verify they are both Cycle variants with same placeholder but different IDs
-            if let (PyObject::Cycle((id1, ph1)), PyObject::Cycle((id2, ph2))) = (&inner1[0], &inner2[0]) {
+            if let (PyObject::Cycle(id1, ph1), PyObject::Cycle(id2, ph2)) = (&inner1[0], &inner2[0]) {
                 assert_ne!(id1, id2, "heap IDs should differ");
                 assert_eq!(ph1, ph2, "placeholders should match (both are lists)");
                 assert_eq!(*ph1, "[...]");

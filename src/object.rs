@@ -13,6 +13,7 @@ use crate::{
     exceptions::{ExcType, SimpleException},
     expressions::FrameExit,
     heap::{Heap, HeapData, HeapId},
+    intern::Interns,
     resource::ResourceTracker,
     value::Value,
     values::{
@@ -54,7 +55,7 @@ use crate::{
 /// - `Float` ↔ JSON float
 /// - `String` ↔ JSON string
 /// - `List` ↔ JSON array
-/// - `Dict` ↔ JSON object (keys must be strings)
+/// - `Dict` ↔ JSON object (keys must be interns)
 ///
 /// **Output-only (serialize only, cannot deserialize from JSON):**
 /// - `Ellipsis` → `{"$ellipsis": true}`
@@ -104,14 +105,14 @@ pub enum PyObject {
     /// string (e.g., `"[...]"` for lists, `"{...}"` for dicts).
     ///
     /// This is output-only and cannot be used as an input to `Executor::run()`.
-    Cycle((usize, &'static str)),
+    Cycle(HeapId, &'static str),
 }
 
 impl fmt::Display for PyObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::String(s) => f.write_str(s),
-            Self::Cycle((_, placeholder)) => f.write_str(placeholder),
+            Self::Cycle(_, placeholder) => f.write_str(placeholder),
             _ => self.repr_fmt(f),
         }
     }
@@ -122,10 +123,12 @@ impl PyObject {
     ///
     /// Takes ownership of the `FrameExit` and its contained `Value`, extracts the value,
     /// then properly drops the Value via `drop_with_heap` to maintain reference counting.
-    pub(crate) fn new<'c, 'e, T: ResourceTracker>(exit: FrameExit<'c, 'e>, heap: &mut Heap<'c, 'e, T>) -> Self {
+    ///
+    /// The `interns` parameter is used to look up interned string/bytes content.
+    pub(crate) fn new<T: ResourceTracker>(exit: FrameExit, heap: &mut Heap<T>, interns: &Interns) -> Self {
         match exit {
             FrameExit::Return(obj) => {
-                let value = Self::from_value(&obj, heap);
+                let value = Self::from_value(&obj, heap, interns);
                 obj.drop_with_heap(heap);
                 value
             }
@@ -141,10 +144,11 @@ impl PyObject {
     /// # Errors
     /// Returns `InvalidInputError` if called on the `Repr` variant,
     /// as it is only valid as an output from code execution, not as an input.
-    pub(crate) fn to_value<'c, 'e, T: ResourceTracker>(
+    pub(crate) fn to_value<T: ResourceTracker>(
         self,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> Result<Value<'c, 'e>, InvalidInputError> {
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> Result<Value, InvalidInputError> {
         match self {
             Self::Ellipsis => Ok(Value::Ellipsis),
             Self::None => Ok(Value::None),
@@ -154,40 +158,41 @@ impl PyObject {
             Self::String(s) => Ok(Value::Ref(heap.allocate(HeapData::Str(Str::new(s)))?)),
             Self::Bytes(b) => Ok(Value::Ref(heap.allocate(HeapData::Bytes(Bytes::new(b)))?)),
             Self::List(items) => {
-                let values: Vec<Value<'c, 'e>> = items
+                let values: Vec<Value> = items
                     .into_iter()
-                    .map(|item| item.to_value(heap))
+                    .map(|item| item.to_value(heap, interns))
                     .collect::<Result<_, _>>()?;
                 Ok(Value::Ref(heap.allocate(HeapData::List(List::new(values)))?))
             }
             Self::Tuple(items) => {
-                let values: Vec<Value<'c, 'e>> = items
+                let values: Vec<Value> = items
                     .into_iter()
-                    .map(|item| item.to_value(heap))
+                    .map(|item| item.to_value(heap, interns))
                     .collect::<Result<_, _>>()?;
                 Ok(Value::Ref(heap.allocate(HeapData::Tuple(Tuple::from_vec(values)))?))
             }
             Self::Dict(map) => {
-                let pairs: Result<Vec<(Value<'c, 'e>, Value<'c, 'e>)>, InvalidInputError> = map
+                let pairs: Result<Vec<(Value, Value)>, InvalidInputError> = map
                     .into_iter()
-                    .map(|(k, v)| Ok((k.to_value(heap)?, v.to_value(heap)?)))
+                    .map(|(k, v)| Ok((k.to_value(heap, interns)?, v.to_value(heap, interns)?)))
                     .collect();
                 // PyObject Dict keys are already validated as hashable, so unwrap is safe
-                let dict = Dict::from_pairs(pairs?, heap).expect("PyObject Dict should only contain hashable keys");
+                let dict =
+                    Dict::from_pairs(pairs?, heap, interns).expect("PyObject Dict should only contain hashable keys");
                 Ok(Value::Ref(heap.allocate(HeapData::Dict(dict))?))
             }
             Self::Exception { exc_type, arg } => {
-                let exc = SimpleException::new(exc_type, arg.map(Into::into));
+                let exc = SimpleException::new(exc_type, arg);
                 Ok(Value::Exc(exc))
             }
             Self::Repr(_) => Err(InvalidInputError::new("Repr")),
-            Self::Cycle(_) => Err(InvalidInputError::new("Cycle")),
+            Self::Cycle(_, _) => Err(InvalidInputError::new("Cycle")),
         }
     }
 
-    fn from_value<T: ResourceTracker>(object: &Value, heap: &Heap<'_, '_, T>) -> Self {
+    fn from_value<T: ResourceTracker>(object: &Value, heap: &Heap<T>, interns: &Interns) -> Self {
         let mut visited = AHashSet::new();
-        Self::from_value_inner(object, heap, &mut visited)
+        Self::from_value_inner(object, heap, &mut visited, interns)
     }
 
     /// Internal helper for converting Value to PyObject with cycle detection.
@@ -197,8 +202,9 @@ impl PyObject {
     /// with an appropriate placeholder string.
     fn from_value_inner<T: ResourceTracker>(
         object: &Value,
-        heap: &Heap<'_, '_, T>,
+        heap: &Heap<T>,
         visited: &mut AHashSet<HeapId>,
+        interns: &Interns,
     ) -> Self {
         match object {
             Value::Undefined => panic!("Undefined found while converting to PyObject"),
@@ -207,8 +213,8 @@ impl PyObject {
             Value::Bool(b) => Self::Bool(*b),
             Value::Int(i) => Self::Int(*i),
             Value::Float(f) => Self::Float(*f),
-            Value::InternString(s) => Self::String((*s).to_owned()),
-            Value::InternBytes(b) => Self::Bytes((*b).to_owned()),
+            Value::InternString(string_id) => Self::String(interns.get_str(*string_id).to_owned()),
+            Value::InternBytes(bytes_id) => Self::Bytes(interns.get_bytes(*bytes_id).to_owned()),
             Value::Exc(exc) => Self::Exception {
                 exc_type: exc.exc_type(),
                 arg: exc.arg().map(ToString::to_string),
@@ -218,10 +224,10 @@ impl PyObject {
                 if visited.contains(id) {
                     // Cycle detected - return appropriate placeholder
                     return match heap.get(*id) {
-                        HeapData::List(_) => Self::Cycle((*id, "[...]")),
-                        HeapData::Tuple(_) => Self::Cycle((*id, "(...)")),
-                        HeapData::Dict(_) => Self::Cycle((*id, "{...}")),
-                        _ => Self::Cycle((*id, "...")),
+                        HeapData::List(_) => Self::Cycle(*id, "[...]"),
+                        HeapData::Tuple(_) => Self::Cycle(*id, "(...)"),
+                        HeapData::Dict(_) => Self::Cycle(*id, "{...}"),
+                        _ => Self::Cycle(*id, "..."),
                     };
                 }
 
@@ -234,14 +240,14 @@ impl PyObject {
                     HeapData::List(list) => Self::List(
                         list.as_vec()
                             .iter()
-                            .map(|obj| PyObject::from_value_inner(obj, heap, visited))
+                            .map(|obj| PyObject::from_value_inner(obj, heap, visited, interns))
                             .collect(),
                     ),
                     HeapData::Tuple(tuple) => Self::Tuple(
                         tuple
                             .as_vec()
                             .iter()
-                            .map(|obj| PyObject::from_value_inner(obj, heap, visited))
+                            .map(|obj| PyObject::from_value_inner(obj, heap, visited, interns))
                             .collect(),
                     ),
                     HeapData::Dict(dict) => {
@@ -249,8 +255,8 @@ impl PyObject {
                         for bucket in dict.as_index_map().values() {
                             for (k, v) in bucket {
                                 new_dict.insert(
-                                    PyObject::from_value_inner(k, heap, visited),
-                                    PyObject::from_value_inner(v, heap, visited),
+                                    PyObject::from_value_inner(k, heap, visited, interns),
+                                    PyObject::from_value_inner(v, heap, visited, interns),
                                 );
                             }
                         }
@@ -259,8 +265,9 @@ impl PyObject {
                     // Cells are internal closure implementation details
                     HeapData::Cell(inner) => {
                         // Show the cell's contents
-                        PyObject::from_value_inner(inner, heap, visited)
+                        PyObject::from_value_inner(inner, heap, visited, interns)
                     }
+                    HeapData::Closure(..) => Self::Repr(object.py_repr(heap, interns).into_owned()),
                 };
 
                 // Remove from visited set after processing
@@ -269,7 +276,7 @@ impl PyObject {
             }
             #[cfg(feature = "dec-ref-check")]
             Value::Dereferenced => panic!("Dereferenced found while converting to PyObject"),
-            _ => Self::Repr(object.py_repr(heap).into_owned()),
+            _ => Self::Repr(object.py_repr(heap, interns).into_owned()),
         }
     }
 
@@ -351,7 +358,7 @@ impl PyObject {
                 f.write_char(')')
             }
             Self::Repr(s) => write!(f, "Repr({})", string_repr(s)),
-            Self::Cycle((_, placeholder)) => f.write_str(placeholder),
+            Self::Cycle(_, placeholder) => f.write_str(placeholder),
         }
     }
 
@@ -379,7 +386,7 @@ impl PyObject {
             Self::Dict(d) => !d.is_empty(),
             Self::Exception { .. } => true,
             Self::Repr(_) => true,
-            Self::Cycle(_) => true,
+            Self::Cycle(_, _) => true,
         }
     }
 
@@ -401,7 +408,7 @@ impl PyObject {
             Self::Dict(_) => "dict",
             Self::Exception { .. } => "Exception",
             Self::Repr(_) => "repr",
-            Self::Cycle(_) => "cycle",
+            Self::Cycle(_, _) => "cycle",
         }
     }
 }
@@ -419,7 +426,7 @@ impl Hash for PyObject {
             Self::Float(f64) => f64.to_bits().hash(state),
             Self::String(string) => string.hash(state),
             Self::Bytes(bytes) => bytes.hash(state),
-            Self::Cycle(_) => panic!("cycle values are not hashable"),
+            Self::Cycle(_, _) => panic!("cycle values are not hashable"),
             _ => panic!("{} python values are not hashable", self.type_name()),
         }
     }
@@ -450,7 +457,7 @@ impl PartialEq for PyObject {
                 },
             ) => a_type == b_type && a_arg == b_arg,
             (Self::Repr(a), Self::Repr(b)) => a == b,
-            (Self::Cycle((a, _)), Self::Cycle((b, _))) => a == b,
+            (Self::Cycle(a, _), Self::Cycle(b, _)) => a == b,
             _ => false,
         }
     }
@@ -652,7 +659,7 @@ impl Serialize for PyObject {
                 map.serialize_entry("$repr", s)?;
                 map.end()
             }
-            Self::Cycle((_, placeholder)) => {
+            Self::Cycle(_, placeholder) => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("$cycle", placeholder)?;
                 map.end()

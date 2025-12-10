@@ -5,7 +5,9 @@ use indexmap::IndexMap;
 
 use crate::args::ArgValues;
 use crate::exceptions::ExcType;
+
 use crate::heap::{Heap, HeapData, HeapId};
+use crate::intern::Interns;
 use crate::resource::ResourceTracker;
 use crate::run::RunResult;
 use crate::value::{Attr, Value};
@@ -18,7 +20,7 @@ use crate::values::{List, PyTrait};
 /// values, items, and pop.
 ///
 /// # Storage Strategy
-/// Uses `IndexMap<u64, Vec<(Value<'c, 'e>, Value<'c, 'e>)>>` to preserve insertion order (matching
+/// Uses `IndexMap<u64, Vec<(Value, Value)>>` to preserve insertion order (matching
 /// Python 3.7+ behavior). The key is the hash of the dict key. The Vec handles hash
 /// collisions by storing multiple (key, value) pairs with the same hash, allowing
 /// proper equality checking for collisions.
@@ -28,20 +30,20 @@ use crate::values::{List, PyTrait};
 /// When using `from_pairs()`, ownership is transferred without incrementing refcounts
 /// (caller must ensure values' refcounts account for the dict's reference).
 #[derive(Debug, Default)]
-pub struct Dict<'c, 'e> {
+pub struct Dict {
     /// Maps hash -> list of (key, value) pairs with that hash
     /// The Vec handles hash collisions. IndexMap preserves insertion order.
-    map: IndexMap<u64, Vec<(Value<'c, 'e>, Value<'c, 'e>)>>,
+    map: IndexMap<u64, Vec<(Value, Value)>>,
 }
 
-impl<'c, 'e> Dict<'c, 'e> {
+impl Dict {
     /// Creates a new empty dict.
     #[must_use]
     pub fn new() -> Self {
         Self { map: IndexMap::new() }
     }
 
-    pub fn as_index_map(&self) -> &IndexMap<u64, Vec<(Value<'c, 'e>, Value<'c, 'e>)>> {
+    pub fn as_index_map(&self) -> &IndexMap<u64, Vec<(Value, Value)>> {
         &self.map
     }
 
@@ -51,13 +53,14 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// Does NOT increment reference counts since ownership is being transferred.
     /// Returns Err if any key is unhashable (e.g., list, dict).
     pub fn from_pairs<T: ResourceTracker>(
-        pairs: Vec<(Value<'c, 'e>, Value<'c, 'e>)>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Self> {
+        pairs: Vec<(Value, Value)>,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<Self> {
         let mut dict = Self::new();
         let mut pairs_iter = pairs.into_iter();
         for (key, value) in pairs_iter.by_ref() {
-            if let Err(err) = dict.set_transfer_ownership(key, value, heap) {
+            if let Err(err) = dict.set_transfer_ownership(key, value, heap, interns) {
                 for (k, v) in pairs_iter {
                     k.drop_with_heap(heap);
                     v.drop_with_heap(heap);
@@ -75,11 +78,12 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// The caller must ensure the values' refcounts already account for this dict's reference.
     fn set_transfer_ownership<T: ResourceTracker>(
         &mut self,
-        key: Value<'c, 'e>,
-        value: Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Option<Value<'c, 'e>>> {
-        let Some(hash) = key.py_hash_u64(heap) else {
+        key: Value,
+        value: Value,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<Option<Value>> {
+        let Some(hash) = key.py_hash_u64(heap, interns) else {
             // Key is unhashable - clean up before returning error
             let err = ExcType::type_error_unhashable(key.py_type(Some(heap)));
             key.drop_with_heap(heap);
@@ -91,7 +95,7 @@ impl<'c, 'e> Dict<'c, 'e> {
 
         // Check if key already exists in bucket
         for (i, (k, _v)) in bucket.iter().enumerate() {
-            if k.py_eq(&key, heap) {
+            if k.py_eq(&key, heap, interns) {
                 // Key exists, replace in place to preserve insertion order
                 // Note: we don't decrement old value's refcount since this is a transfer
                 // and we don't increment new value's refcount either
@@ -105,7 +109,7 @@ impl<'c, 'e> Dict<'c, 'e> {
         Ok(None)
     }
 
-    fn drop_all_entries<T: ResourceTracker>(&mut self, heap: &mut Heap<'c, 'e, T>) {
+    fn drop_all_entries<T: ResourceTracker>(&mut self, heap: &mut Heap<T>) {
         for bucket in self.map.values_mut() {
             for (key, value) in bucket.drain(..) {
                 key.drop_with_heap(heap);
@@ -120,15 +124,16 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// Returns Err if key is unhashable.
     pub fn get<T: ResourceTracker>(
         &self,
-        key: &Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Option<&Value<'c, 'e>>> {
+        key: &Value,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<Option<&Value>> {
         let hash = key
-            .py_hash_u64(heap)
+            .py_hash_u64(heap, interns)
             .ok_or_else(|| ExcType::type_error_unhashable(key.py_type(Some(heap))))?;
         if let Some(bucket) = self.map.get(&hash) {
             for (k, v) in bucket {
-                if k.py_eq(key, heap) {
+                if k.py_eq(key, heap, interns) {
                     return Ok(Some(v));
                 }
             }
@@ -147,19 +152,20 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// Returns Err if key is unhashable.
     pub fn set<T: ResourceTracker>(
         &mut self,
-        key: Value<'c, 'e>,
-        value: Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Option<Value<'c, 'e>>> {
+        key: Value,
+        value: Value,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<Option<Value>> {
         let hash = key
-            .py_hash_u64(heap)
+            .py_hash_u64(heap, interns)
             .ok_or_else(|| ExcType::type_error_unhashable(key.py_type(Some(heap))))?;
 
         let bucket = self.map.entry(hash).or_default();
 
         // Check if key already exists in bucket
         for (i, (k, _v)) in bucket.iter().enumerate() {
-            if k.py_eq(&key, heap) {
+            if k.py_eq(&key, heap, interns) {
                 // Key exists, replace in place to preserve insertion order within the bucket
                 let (old_key, old_value) = std::mem::replace(&mut bucket[i], (key, value));
 
@@ -184,16 +190,17 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// caller assumes ownership and is responsible for managing their refcounts.
     pub fn pop<T: ResourceTracker>(
         &mut self,
-        key: &Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Option<(Value<'c, 'e>, Value<'c, 'e>)>> {
+        key: &Value,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<Option<(Value, Value)>> {
         let hash = key
-            .py_hash_u64(heap)
+            .py_hash_u64(heap, interns)
             .ok_or_else(|| ExcType::type_error_unhashable(key.py_type(Some(heap))))?;
 
         if let Some(bucket) = self.map.get_mut(&hash) {
             for (i, (k, _v)) in bucket.iter().enumerate() {
-                if k.py_eq(key, heap) {
+                if k.py_eq(key, heap, interns) {
                     let (old_key, old_value) = bucket.swap_remove(i);
                     if bucket.is_empty() {
                         self.map.shift_remove(&hash);
@@ -211,7 +218,7 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// Each key's reference count is incremented since the returned vector
     /// now holds additional references to these values.
     #[must_use]
-    pub fn keys<T: ResourceTracker>(&self, heap: &mut Heap<'c, 'e, T>) -> Vec<Value<'c, 'e>> {
+    pub fn keys<T: ResourceTracker>(&self, heap: &mut Heap<T>) -> Vec<Value> {
         let mut result = Vec::new();
         for bucket in self.map.values() {
             for (k, _v) in bucket {
@@ -226,7 +233,7 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// Each value's reference count is incremented since the returned vector
     /// now holds additional references to these values.
     #[must_use]
-    pub fn values_list<T: ResourceTracker>(&self, heap: &mut Heap<'c, 'e, T>) -> Vec<Value<'c, 'e>> {
+    pub fn values_list<T: ResourceTracker>(&self, heap: &mut Heap<T>) -> Vec<Value> {
         let mut result = Vec::new();
         for bucket in self.map.values() {
             for (_k, v) in bucket {
@@ -241,7 +248,7 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// Each key and value's reference count is incremented since the returned vector
     /// now holds additional references to these values.
     #[must_use]
-    pub fn items<T: ResourceTracker>(&self, heap: &mut Heap<'c, 'e, T>) -> Vec<(Value<'c, 'e>, Value<'c, 'e>)> {
+    pub fn items<T: ResourceTracker>(&self, heap: &mut Heap<T>) -> Vec<(Value, Value)> {
         let mut result = Vec::new();
         for bucket in self.map.values() {
             for (k, v) in bucket {
@@ -269,10 +276,10 @@ impl<'c, 'e> Dict<'c, 'e> {
     /// incremented. This should be used instead of `.clone()` which would
     /// bypass reference counting.
     #[must_use]
-    pub fn clone_with_heap<T: ResourceTracker>(&self, heap: &mut Heap<'c, 'e, T>) -> Self {
+    pub fn clone_with_heap<T: ResourceTracker>(&self, heap: &mut Heap<T>) -> Self {
         let mut new_map = IndexMap::new();
         for (hash, bucket) in &self.map {
-            let new_bucket: Vec<(Value<'c, 'e>, Value<'c, 'e>)> = bucket
+            let new_bucket: Vec<(Value, Value)> = bucket
                 .iter()
                 .map(|(k, v)| (k.clone_with_heap(heap), v.clone_with_heap(heap)))
                 .collect();
@@ -282,8 +289,8 @@ impl<'c, 'e> Dict<'c, 'e> {
     }
 }
 
-impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
-    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<'c, 'e, T>>) -> &'static str {
+impl PyTrait for Dict {
+    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<T>>) -> &'static str {
         "dict"
     }
 
@@ -292,11 +299,11 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
         std::mem::size_of::<Self>() + self.len() * 2 * std::mem::size_of::<Value>()
     }
 
-    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> Option<usize> {
+    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> Option<usize> {
         Some(self.len())
     }
 
-    fn py_eq<T: ResourceTracker>(&self, other: &Self, heap: &mut Heap<'c, 'e, T>) -> bool {
+    fn py_eq<T: ResourceTracker>(&self, other: &Self, heap: &mut Heap<T>, interns: &Interns) -> bool {
         if self.len() != other.len() {
             return false;
         }
@@ -304,9 +311,9 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
         // Check that all keys in self exist in other with equal values
         for bucket in self.map.values() {
             for (k, v) in bucket {
-                match other.get(k, heap) {
+                match other.get(k, heap, interns) {
                     Ok(Some(other_v)) => {
-                        if !v.py_eq(other_v, heap) {
+                        if !v.py_eq(other_v, heap, interns) {
                             return false;
                         }
                     }
@@ -334,15 +341,16 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
         }
     }
 
-    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> bool {
+    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> bool {
         !self.is_empty()
     }
 
     fn py_repr_fmt<W: Write, T: ResourceTracker>(
         &self,
         f: &mut W,
-        heap: &Heap<'c, 'e, T>,
-        heap_ids: &mut AHashSet<usize>,
+        heap: &Heap<T>,
+        heap_ids: &mut AHashSet<HeapId>,
+        interns: &Interns,
     ) -> std::fmt::Result {
         if self.is_empty() {
             return f.write_str("{}");
@@ -356,21 +364,17 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
                     f.write_str(", ")?;
                 }
                 first = false;
-                k.py_repr_fmt(f, heap, heap_ids)?;
+                k.py_repr_fmt(f, heap, heap_ids, interns)?;
                 f.write_str(": ")?;
-                v.py_repr_fmt(f, heap, heap_ids)?;
+                v.py_repr_fmt(f, heap, heap_ids, interns)?;
             }
         }
         f.write_char('}')
     }
 
-    fn py_getitem<T: ResourceTracker>(
-        &self,
-        key: &Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+    fn py_getitem<T: ResourceTracker>(&self, key: &Value, heap: &mut Heap<T>, interns: &Interns) -> RunResult<Value> {
         // Use copy_for_extend to avoid borrow conflict, then increment refcount
-        let result = self.get(key, heap)?.map(Value::copy_for_extend);
+        let result = self.get(key, heap, interns)?.map(Value::copy_for_extend);
         match result {
             Some(value) => {
                 if let Value::Ref(id) = &value {
@@ -378,18 +382,19 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
                 }
                 Ok(value)
             }
-            None => Err(ExcType::key_error(key, heap)),
+            None => Err(ExcType::key_error(key, heap, interns)),
         }
     }
 
     fn py_setitem<T: ResourceTracker>(
         &mut self,
-        key: Value<'c, 'e>,
-        value: Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'c, ()> {
+        key: Value,
+        value: Value,
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> RunResult<()> {
         // Drop the old value if one was replaced
-        if let Some(old_value) = self.set(key, value, heap)? {
+        if let Some(old_value) = self.set(key, value, heap, interns)? {
             old_value.drop_with_heap(heap);
         }
         Ok(())
@@ -397,10 +402,11 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
 
     fn py_call_attr<T: ResourceTracker>(
         &mut self,
-        heap: &mut Heap<'c, 'e, T>,
+        heap: &mut Heap<T>,
         attr: &Attr,
-        args: ArgValues<'c, 'e>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+        args: ArgValues,
+        interns: &Interns,
+    ) -> RunResult<Value> {
         match attr {
             #[allow(clippy::manual_let_else)]
             Attr::Get => {
@@ -408,7 +414,7 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
                 let (key, default) = args.get_one_two_args("get")?;
                 let default = default.unwrap_or(Value::None);
                 // Handle the lookup - may fail for unhashable keys
-                let result = match self.get(&key, heap) {
+                let result = match self.get(&key, heap, interns) {
                     Ok(r) => r,
                     Err(e) => {
                         // Drop key and default before returning error
@@ -442,7 +448,7 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
                 args.check_zero_args("dict.items")?;
                 // Return list of tuples
                 let items = self.items(heap);
-                let mut tuples: Vec<Value<'c, 'e>> = Vec::with_capacity(items.len());
+                let mut tuples: Vec<Value> = Vec::with_capacity(items.len());
                 for (k, v) in items {
                     let tuple_id = heap.allocate(HeapData::Tuple(vec![k, v].into()))?;
                     tuples.push(Value::Ref(tuple_id));
@@ -454,7 +460,7 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
             Attr::Pop => {
                 // dict.pop() accepts 1 or 2 arguments (key, optional default)
                 let (key, default) = args.get_one_two_args("pop")?;
-                let result = match self.pop(&key, heap) {
+                let result = match self.pop(&key, heap, interns) {
                     Ok(r) => r,
                     Err(e) => {
                         // Clean up key and default before returning error
@@ -480,7 +486,7 @@ impl<'c, 'e> PyTrait<'c, 'e> for Dict<'c, 'e> {
                         key.drop_with_heap(heap);
                         Ok(d)
                     } else {
-                        let err = ExcType::key_error(&key, heap);
+                        let err = ExcType::key_error(&key, heap, interns);
                         key.drop_with_heap(heap);
                         Err(err)
                     }

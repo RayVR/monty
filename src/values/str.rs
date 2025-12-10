@@ -8,6 +8,7 @@ use std::fmt::Write;
 use ahash::AHashSet;
 
 use crate::heap::{Heap, HeapData, HeapId};
+use crate::intern::Interns;
 use crate::resource::ResourceTracker;
 use crate::value::Value;
 use crate::values::PyTrait;
@@ -64,8 +65,8 @@ impl std::ops::Deref for Str {
     }
 }
 
-impl<'c, 'e> PyTrait<'c, 'e> for Str {
-    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<'c, 'e, T>>) -> &'static str {
+impl PyTrait for Str {
+    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<T>>) -> &'static str {
         "str"
     }
 
@@ -73,42 +74,44 @@ impl<'c, 'e> PyTrait<'c, 'e> for Str {
         std::mem::size_of::<Self>() + self.0.len()
     }
 
-    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> Option<usize> {
+    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> Option<usize> {
         // Count Unicode characters, not bytes, to match Python semantics
         Some(self.0.chars().count())
     }
 
-    fn py_eq<T: ResourceTracker>(&self, other: &Self, _heap: &mut Heap<'c, 'e, T>) -> bool {
+    fn py_eq<T: ResourceTracker>(&self, other: &Self, _heap: &mut Heap<T>, _interns: &Interns) -> bool {
         self.0 == other.0
     }
 
-    /// Strings don't contain nested heap references.
+    /// Interns don't contain nested heap references.
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // No-op: strings don't hold Value references
     }
 
-    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> bool {
+    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> bool {
         !self.0.is_empty()
     }
 
     fn py_repr_fmt<W: Write, T: ResourceTracker>(
         &self,
         f: &mut W,
-        _heap: &Heap<'c, 'e, T>,
-        _heap_ids: &mut AHashSet<usize>,
+        _heap: &Heap<T>,
+        _heap_ids: &mut AHashSet<HeapId>,
+        _interns: &Interns,
     ) -> std::fmt::Result {
         string_repr_fmt(&self.0, f)
     }
 
-    fn py_str<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> Cow<'static, str> {
+    fn py_str<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> Cow<'static, str> {
         self.0.clone().into()
     }
 
     fn py_add<T: ResourceTracker>(
         &self,
         other: &Self,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> Result<Option<Value<'c, 'e>>, crate::resource::ResourceError> {
+        heap: &mut Heap<T>,
+        _interns: &Interns,
+    ) -> Result<Option<Value>, crate::resource::ResourceError> {
         let result = format!("{}{}", self.0, other.0);
         let id = heap.allocate(HeapData::Str(result.into()))?;
         Ok(Some(Value::Ref(id)))
@@ -116,9 +119,10 @@ impl<'c, 'e> PyTrait<'c, 'e> for Str {
 
     fn py_iadd<T: ResourceTracker>(
         &mut self,
-        other: Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
+        other: Value,
+        heap: &mut Heap<T>,
         self_id: Option<HeapId>,
+        interns: &Interns,
     ) -> Result<bool, crate::resource::ResourceError> {
         match other {
             Value::Ref(other_id) => {
@@ -132,6 +136,10 @@ impl<'c, 'e> PyTrait<'c, 'e> for Str {
                 } else {
                     Ok(false)
                 }
+            }
+            Value::InternString(string_id) => {
+                self.0.push_str(interns.get_str(string_id));
+                Ok(true)
             }
             _ => Ok(false),
         }

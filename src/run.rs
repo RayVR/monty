@@ -4,16 +4,17 @@ use crate::exceptions::{
     exc_err_static, exc_fmt, internal_err, ExcType, InternalRunError, RunError, SimpleException, StackFrame,
 };
 use crate::expressions::{ExprLoc, FrameExit, Identifier, NameScope, Node};
-use crate::function::Function;
-use crate::heap::Heap;
-use crate::namespace::{Namespaces, GLOBAL_NS_IDX};
+use crate::heap::{Heap, HeapData};
+use crate::intern::{FunctionId, Interns, StringId, MODULE_STRING_ID};
+use crate::namespace::{NamespaceId, Namespaces, GLOBAL_NS_IDX};
 use crate::operators::Operator;
 use crate::parse::CodeRange;
 use crate::resource::ResourceTracker;
 use crate::value::Value;
 use crate::values::PyTrait;
 
-pub type RunResult<'c, T> = Result<T, RunError<'c>>;
+/// Result type for runtime operations.
+pub type RunResult<T> = Result<T, RunError>;
 
 /// Represents an execution frame with an index into Namespaces.
 ///
@@ -31,24 +32,27 @@ pub type RunResult<'c, T> = Result<T, RunError<'c>>;
 /// When accessing a variable with `NameScope::Cell`, we look up the namespace
 /// slot to get the `Value::Ref(cell_id)`, then read/write through that cell.
 #[derive(Debug)]
-pub(crate) struct RunFrame<'c> {
+pub struct RunFrame<'i> {
     /// Index of this frame's local namespace in Namespaces.
-    local_idx: usize,
+    local_idx: NamespaceId,
     /// Parent stack frame for error reporting.
-    parent: Option<StackFrame<'c>>,
+    parent: Option<StackFrame>,
     /// The name of the current frame (function name or "<module>").
-    name: &'c str,
+    /// Uses string id to lookup
+    name: StringId,
+    interns: &'i Interns,
 }
 
-impl<'c> RunFrame<'c> {
+impl<'i> RunFrame<'i> {
     /// Creates a new frame for module-level execution.
     ///
     /// At module level, `local_idx` is `GLOBAL_NS_IDX` (0).
-    pub fn new() -> Self {
+    pub fn module_frame(interns: &'i Interns) -> Self {
         Self {
             local_idx: GLOBAL_NS_IDX,
             parent: None,
-            name: "<module>",
+            name: MODULE_STRING_ID,
+            interns,
         }
     }
 
@@ -62,25 +66,28 @@ impl<'c> RunFrame<'c> {
     ///
     /// # Arguments
     /// * `local_idx` - Index of the function's local namespace in Namespaces
-    /// * `name` - The function name (for error messages)
+    /// * `name` - The function name StringId (for error messages)
     /// * `parent` - Parent stack frame for error traceback
-    pub fn new_for_function(local_idx: usize, name: &'c str, parent: Option<StackFrame<'c>>) -> Self {
+    pub fn function_frame(
+        local_idx: NamespaceId,
+        name: StringId,
+        parent: Option<StackFrame>,
+        interns: &'i Interns,
+    ) -> Self {
         Self {
             local_idx,
             parent,
             name,
+            interns,
         }
     }
 
-    pub fn execute<'e, T: ResourceTracker>(
+    pub fn execute<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        nodes: &'e [Node<'c>],
-    ) -> RunResult<'c, FrameExit<'c, 'e>>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        nodes: &[Node],
+    ) -> RunResult<FrameExit> {
         for node in nodes {
             // Check time limit at statement boundaries
             heap.tracker().check_time()?;
@@ -103,18 +110,17 @@ impl<'c> RunFrame<'c> {
         Ok(FrameExit::Return(Value::None))
     }
 
-    fn execute_node<'e, T: ResourceTracker>(
+    fn execute_node<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        node: &'e Node<'c>,
-    ) -> RunResult<'c, Option<FrameExit<'c, 'e>>>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        node: &Node,
+    ) -> RunResult<Option<FrameExit>> {
         match node {
             Node::Expr(expr) => {
-                if let Err(mut e) = EvaluateExpr::new(namespaces, self.local_idx, heap).evaluate_discard(expr) {
+                if let Err(mut e) =
+                    EvaluateExpr::new(namespaces, self.local_idx, heap, self.interns).evaluate_discard(expr)
+                {
                     set_name(self.name, &mut e);
                     return Err(e);
                 }
@@ -135,21 +141,18 @@ impl<'c> RunFrame<'c> {
                 or_else,
             } => self.for_loop(namespaces, heap, target, iter, body, or_else)?,
             Node::If { test, body, or_else } => self.if_(namespaces, heap, test, body, or_else)?,
-            Node::FunctionDef(function) => self.define_function(namespaces, heap, function),
+            Node::FunctionDef(function_id) => self.define_function(namespaces, heap, *function_id)?,
         }
         Ok(None)
     }
 
-    fn execute_expr<'e, T: ResourceTracker>(
+    fn execute_expr<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        expr: &'e ExprLoc<'c>,
-    ) -> RunResult<'c, Value<'c, 'e>>
-    where
-        'c: 'e,
-    {
-        match EvaluateExpr::new(namespaces, self.local_idx, heap).evaluate_use(expr) {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        expr: &ExprLoc,
+    ) -> RunResult<Value> {
+        match EvaluateExpr::new(namespaces, self.local_idx, heap, self.interns).evaluate_use(expr) {
             Ok(value) => Ok(value),
             Err(mut e) => {
                 set_name(self.name, &mut e);
@@ -158,16 +161,13 @@ impl<'c> RunFrame<'c> {
         }
     }
 
-    fn execute_expr_bool<'e, T: ResourceTracker>(
+    fn execute_expr_bool<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        expr: &'e ExprLoc<'c>,
-    ) -> RunResult<'c, bool>
-    where
-        'c: 'e,
-    {
-        match EvaluateExpr::new(namespaces, self.local_idx, heap).evaluate_bool(expr) {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        expr: &ExprLoc,
+    ) -> RunResult<bool> {
+        match EvaluateExpr::new(namespaces, self.local_idx, heap, self.interns).evaluate_bool(expr) {
             Ok(value) => Ok(value),
             Err(mut e) => {
                 set_name(self.name, &mut e);
@@ -182,30 +182,28 @@ impl<'c> RunFrame<'c> {
     /// * Exception instance (Value::Exc) - raise directly
     /// * Exception type (Value::Callable with ExcType) - instantiate then raise
     /// * Anything else - TypeError
-    fn raise<'e, T: ResourceTracker>(
+    fn raise<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        op_exc_expr: Option<&'e ExprLoc<'c>>,
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        op_exc_expr: Option<&ExprLoc>,
+    ) -> RunResult<()> {
         if let Some(exc_expr) = op_exc_expr {
             let value = self.execute_expr(namespaces, heap, exc_expr)?;
             match &value {
                 Value::Exc(_) => {
                     // Match on the reference then use into_exc() due to issues with destructuring Value
                     let exc = value.into_exc();
-                    return Err(exc.with_frame(self.stack_frame(&exc_expr.position)).into());
+                    return Err(exc.with_frame(self.stack_frame(exc_expr.position)).into());
                 }
-                Value::Callable(callable) => {
-                    let result = callable.call(namespaces, self.local_idx, heap, ArgValues::Zero)?;
-                    // Drop the original callable value
+                Value::Builtin(builtin) => {
+                    // Callable is inline - call it to get the exception
+                    let builtin = *builtin;
+                    let result = builtin.call(heap, ArgValues::Zero, self.interns)?;
                     if matches!(&result, Value::Exc(_)) {
-                        value.drop_with_heap(heap);
+                        // No need to drop value - Callable is Copy and doesn't need cleanup
                         let exc = result.into_exc();
-                        return Err(exc.with_frame(self.stack_frame(&exc_expr.position)).into());
+                        return Err(exc.with_frame(self.stack_frame(exc_expr.position)).into());
                     }
                 }
                 _ => {}
@@ -221,44 +219,37 @@ impl<'c> RunFrame<'c> {
     /// `AssertionError` if the test is falsy.
     ///
     /// If a message expression is provided, it is evaluated and used as the exception message.
-    fn assert_<'e, T: ResourceTracker>(
+    fn assert_<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        test: &'e ExprLoc<'c>,
-        msg: Option<&'e ExprLoc<'c>>,
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        test: &ExprLoc,
+        msg: Option<&ExprLoc>,
+    ) -> RunResult<()> {
         if !self.execute_expr_bool(namespaces, heap, test)? {
             let msg = if let Some(msg_expr) = msg {
                 Some(
                     self.execute_expr(namespaces, heap, msg_expr)?
-                        .py_str(heap)
-                        .to_string()
-                        .into(),
+                        .py_str(heap, self.interns)
+                        .to_string(),
                 )
             } else {
                 None
             };
             return Err(SimpleException::new(ExcType::AssertionError, msg)
-                .with_frame(self.stack_frame(&test.position))
+                .with_frame(self.stack_frame(test.position))
                 .into());
         }
         Ok(())
     }
 
-    fn assign<'e, T: ResourceTracker>(
+    fn assign<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        target: &'e Identifier<'c>,
-        expr: &'e ExprLoc<'c>,
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        target: &Identifier,
+        expr: &ExprLoc,
+    ) -> RunResult<()> {
         let new_value = self.execute_expr(namespaces, heap, expr)?;
 
         // Determine which namespace to use
@@ -270,30 +261,27 @@ impl<'c> RunFrame<'c> {
         if target.scope == NameScope::Cell {
             // Cell assignment - look up cell HeapId from namespace slot, then write through it
             let namespace = namespaces.get_mut(ns_idx);
-            let Value::Ref(cell_id) = namespace[target.heap_id()] else {
+            let Value::Ref(cell_id) = namespace.get(target.namespace_id()) else {
                 panic!("Cell variable slot doesn't contain a cell reference - prepare-time bug")
             };
-            heap.set_cell_value(cell_id, new_value);
+            heap.set_cell_value(*cell_id, new_value);
         } else {
             // Direct assignment to namespace slot (Local or Global)
             let namespace = namespaces.get_mut(ns_idx);
-            let old_value = std::mem::replace(&mut namespace[target.heap_id()], new_value);
+            let old_value = std::mem::replace(namespace.get_mut(target.namespace_id()), new_value);
             old_value.drop_with_heap(heap);
         }
         Ok(())
     }
 
-    fn op_assign<'e, T: ResourceTracker>(
+    fn op_assign<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        target: &Identifier<'c>,
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        target: &Identifier,
         op: &Operator,
-        expr: &'e ExprLoc<'c>,
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        expr: &ExprLoc,
+    ) -> RunResult<()> {
         let rhs = self.execute_expr(namespaces, heap, expr)?;
         // Capture rhs type before it's consumed
         let rhs_type = rhs.py_type(Some(heap));
@@ -301,16 +289,16 @@ impl<'c> RunFrame<'c> {
         // Cell variables need special handling - read through cell, modify, write back
         let err_target_type = if target.scope == NameScope::Cell {
             let namespace = namespaces.get_mut(self.local_idx);
-            let Value::Ref(cell_id) = namespace[target.heap_id()] else {
+            let Value::Ref(cell_id) = namespace.get(target.namespace_id()) else {
                 panic!("Cell variable slot doesn't contain a cell reference - prepare-time bug")
             };
-            let mut cell_value = heap.get_cell_value(cell_id);
+            let mut cell_value = heap.get_cell_value(*cell_id);
             // Capture type before potential drop
             let cell_value_type = cell_value.py_type(Some(heap));
-            let result: RunResult<'c, Option<Value<'c, 'e>>> = match op {
+            let result: RunResult<Option<Value>> = match op {
                 // In-place add has special optimization for mutable types
                 Operator::Add => {
-                    let ok = cell_value.py_iadd(rhs, heap, None)?;
+                    let ok = cell_value.py_iadd(rhs, heap, None, self.interns)?;
                     if ok {
                         Ok(Some(cell_value))
                     } else {
@@ -319,7 +307,7 @@ impl<'c> RunFrame<'c> {
                 }
                 // For other operators, use binary op + replace
                 Operator::Mult => {
-                    let new_val = cell_value.py_mult(&rhs, heap)?;
+                    let new_val = cell_value.py_mult(&rhs, heap, self.interns)?;
                     rhs.drop_with_heap(heap);
                     cell_value.drop_with_heap(heap);
                     Ok(new_val)
@@ -358,19 +346,19 @@ impl<'c> RunFrame<'c> {
             };
             match result? {
                 Some(new_value) => {
-                    heap.set_cell_value(cell_id, new_value);
+                    heap.set_cell_value(*cell_id, new_value);
                     None
                 }
                 None => Some(cell_value_type),
             }
         } else {
             // Direct access for Local/Global scopes
-            let target_val = namespaces.get_var_mut(self.local_idx, target)?;
+            let target_val = namespaces.get_var_mut(self.local_idx, target, self.interns)?;
             let target_type = target_val.py_type(Some(heap));
-            let result: RunResult<'c, Option<()>> = match op {
+            let result: RunResult<Option<()>> = match op {
                 // In-place add has special optimization for mutable types
                 Operator::Add => {
-                    let ok = target_val.py_iadd(rhs, heap, None)?;
+                    let ok = target_val.py_iadd(rhs, heap, None, self.interns)?;
                     if ok {
                         Ok(Some(()))
                     } else {
@@ -379,7 +367,7 @@ impl<'c> RunFrame<'c> {
                 }
                 // For other operators, use binary op + replace
                 Operator::Mult => {
-                    let new_val = target_val.py_mult(&rhs, heap)?;
+                    let new_val = target_val.py_mult(&rhs, heap, self.interns)?;
                     rhs.drop_with_heap(heap);
                     if let Some(v) = new_val {
                         let old = std::mem::replace(target_val, v);
@@ -454,47 +442,42 @@ impl<'c> RunFrame<'c> {
 
         if let Some(target_type) = err_target_type {
             let e = SimpleException::augmented_assign_type_error(op, target_type, rhs_type);
-            Err(e.with_frame(self.stack_frame(&expr.position)).into())
+            Err(e.with_frame(self.stack_frame(expr.position)).into())
         } else {
             Ok(())
         }
     }
 
-    fn subscript_assign<'e, T: ResourceTracker>(
+    fn subscript_assign<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        target: &Identifier<'c>,
-        index: &'e ExprLoc<'c>,
-        value: &'e ExprLoc<'c>,
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        target: &Identifier,
+        index: &ExprLoc,
+        value: &ExprLoc,
+    ) -> RunResult<()> {
         let key = self.execute_expr(namespaces, heap, index)?;
         let val = self.execute_expr(namespaces, heap, value)?;
-        let target_val = namespaces.get_var_mut(self.local_idx, target)?;
+        let target_val = namespaces.get_var_mut(self.local_idx, target, self.interns)?;
         if let Value::Ref(id) = target_val {
             let id = *id;
-            heap.with_entry_mut(id, |heap, data| data.py_setitem(key, val, heap))
+            heap.with_entry_mut(id, |heap, data| data.py_setitem(key, val, heap, self.interns))
         } else {
             let e = exc_fmt!(ExcType::TypeError; "'{}' object does not support item assignment", target_val.py_type(Some(heap)));
-            Err(e.with_frame(self.stack_frame(&index.position)).into())
+            Err(e.with_frame(self.stack_frame(index.position)).into())
         }
     }
 
-    fn for_loop<'e, T: ResourceTracker>(
+    #[allow(clippy::too_many_arguments)]
+    fn for_loop<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
         target: &Identifier,
-        iter: &'e ExprLoc<'c>,
-        body: &'e [Node<'c>],
-        _or_else: &'e [Node<'c>],
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        iter: &ExprLoc,
+        body: &[Node],
+        _or_else: &[Node],
+    ) -> RunResult<()> {
         let Value::Range(range_size) = self.execute_expr(namespaces, heap, iter)? else {
             return internal_err!(InternalRunError::TodoError; "`for` iter must be a range");
         };
@@ -502,23 +485,20 @@ impl<'c> RunFrame<'c> {
         for value in 0i64..range_size {
             // For loop target is always local scope
             let namespace = namespaces.get_mut(self.local_idx);
-            namespace[target.heap_id()] = Value::Int(value);
+            namespace.set(target.namespace_id(), Value::Int(value));
             self.execute(namespaces, heap, body)?;
         }
         Ok(())
     }
 
-    fn if_<'e, T: ResourceTracker>(
+    fn if_<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        test: &'e ExprLoc<'c>,
-        body: &'e [Node<'c>],
-        or_else: &'e [Node<'c>],
-    ) -> RunResult<'c, ()>
-    where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        test: &ExprLoc,
+        body: &[Node],
+        or_else: &[Node],
+    ) -> RunResult<()> {
         if self.execute_expr_bool(namespaces, heap, test)? {
             self.execute(namespaces, heap, body)?;
         } else {
@@ -538,14 +518,13 @@ impl<'c> RunFrame<'c> {
     /// Closures share cells with their enclosing scope. The cell HeapIds are
     /// looked up from the enclosing namespace slots specified in free_var_enclosing_slots.
     /// This ensures modifications through `nonlocal` are visible to both scopes.
-    fn define_function<'e, T: ResourceTracker>(
+    fn define_function<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        function: &'e Function<'c>,
-    ) where
-        'c: 'e,
-    {
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        function_id: FunctionId,
+    ) -> RunResult<()> {
+        let function = self.interns.get_function(function_id);
         let new_value = if function.is_closure() {
             // This function captures variables from enclosing scopes.
             // Look up the cell HeapIds from the enclosing namespace.
@@ -554,33 +533,34 @@ impl<'c> RunFrame<'c> {
 
             for &enclosing_slot in &function.free_var_enclosing_slots {
                 // The enclosing namespace slot contains Value::Ref(cell_id)
-                let Value::Ref(cell_id) = enclosing_namespace[enclosing_slot] else {
-                    panic!("Expected cell in enclosing namespace slot {enclosing_slot} - prepare-time bug")
+                let Value::Ref(cell_id) = enclosing_namespace.get(enclosing_slot) else {
+                    panic!("Expected cell in enclosing namespace slot {enclosing_slot:?} - prepare-time bug")
                 };
 
                 // Increment the cell's refcount since this closure now holds a reference
-                heap.inc_ref(cell_id);
-                captured_cells.push(cell_id);
+                heap.inc_ref(*cell_id);
+                captured_cells.push(*cell_id);
             }
 
-            Value::Closure(function, captured_cells)
+            Value::Ref(heap.allocate(HeapData::Closure(function_id, captured_cells))?)
         } else {
             // Simple function without captures
-            Value::Function(function)
+            Value::Function(function_id)
         };
 
         let namespace = namespaces.get_mut(self.local_idx);
-        let old_value = std::mem::replace(&mut namespace[function.name.heap_id()], new_value);
+        let old_value = std::mem::replace(namespace.get_mut(function.name.namespace_id()), new_value);
         // Drop the old value properly (dec_ref for Refs, no-op for others)
         old_value.drop_with_heap(heap);
+        Ok(())
     }
 
-    fn stack_frame(&self, position: &CodeRange<'c>) -> StackFrame<'c> {
+    fn stack_frame(&self, position: CodeRange) -> StackFrame {
         StackFrame::new(position, self.name, self.parent.as_ref())
     }
 }
 
-fn set_name<'e>(name: &'e str, error: &mut RunError<'e>) {
+fn set_name(name: StringId, error: &mut RunError) {
     if let RunError::Exc(ref mut exc) = error {
         if let Some(ref mut stack_frame) = exc.frame {
             stack_frame.frame_name = Some(name);

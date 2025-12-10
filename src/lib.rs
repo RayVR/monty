@@ -7,6 +7,7 @@ mod expressions;
 mod fstring;
 mod function;
 mod heap;
+mod intern;
 mod namespace;
 mod object;
 mod operators;
@@ -18,13 +19,12 @@ mod run;
 mod value;
 mod values;
 
-#[cfg(feature = "ref-counting")]
-use ahash::AHashMap;
-
 use crate::exceptions::InternalRunError;
 pub use crate::exceptions::RunError;
 use crate::expressions::Node;
+
 use crate::heap::Heap;
+use crate::intern::Interns;
 use crate::namespace::Namespaces;
 pub use crate::object::{InvalidInputError, PyObject};
 use crate::parse::parse;
@@ -37,30 +37,31 @@ use crate::value::Value;
 
 /// Main executor that compiles and runs Python code.
 ///
-/// The executor stores the compiled AST and initial namespace as literals (not runtime
-/// values). When `run()` is called, literals are converted to heap-allocated runtime
-/// values, ensuring proper reference counting from the start of execution.
+/// The executor stores the compiled AST.
 ///
 /// When the `ref-counting` feature is enabled, `run_ref_counts()` can be used to
 /// execute code and retrieve reference count data for testing purposes.
 #[derive(Debug)]
-pub struct Executor<'c> {
+pub struct Executor {
     namespace_size: usize,
     /// Maps variable names to their indices in the namespace. Used for ref-count testing.
     #[cfg(feature = "ref-counting")]
-    name_map: AHashMap<String, usize>,
-    nodes: Vec<Node<'c>>,
+    name_map: ahash::AHashMap<String, crate::namespace::NamespaceId>,
+    nodes: Vec<Node>,
+    /// Interned strings used for looking up names and filenames during execution.
+    interns: Interns,
 }
 
-impl<'c> Executor<'c> {
-    pub fn new(code: &'c str, filename: &'c str, input_names: &[&str]) -> Result<Self, ParseError<'c>> {
-        let nodes = parse(code, filename)?;
-        let prepared = prepare(nodes, input_names)?;
+impl Executor {
+    pub fn new(code: &str, filename: &str, input_names: &[&str]) -> Result<Self, ParseError> {
+        let parse_result = parse(code, filename)?;
+        let prepared = prepare(parse_result, input_names)?;
         Ok(Self {
             namespace_size: prepared.namespace_size,
             #[cfg(feature = "ref-counting")]
             name_map: prepared.name_map,
             nodes: prepared.nodes,
+            interns: Interns::new(prepared.interner, prepared.functions),
         })
     }
 
@@ -71,7 +72,7 @@ impl<'c> Executor<'c> {
     ///
     /// # Arguments
     /// * `inputs` - Values to fill the first N slots of the namespace (e.g., function parameters)
-    pub fn run_no_limits(&self, inputs: Vec<PyObject>) -> Result<PyObject, RunError<'c>> {
+    pub fn run_no_limits(&self, inputs: Vec<PyObject>) -> Result<PyObject, RunError> {
         self.run_with_tracker(inputs, NoLimitTracker::default())
     }
 
@@ -95,7 +96,7 @@ impl<'c> Executor<'c> {
     /// let ex = Executor::new("1 + 2", "test.py", &[]).unwrap();
     /// let result = ex.run_with_limits(vec![], limits);
     /// ```
-    pub fn run_with_limits(&self, inputs: Vec<PyObject>, limits: ResourceLimits) -> Result<PyObject, RunError<'c>> {
+    pub fn run_with_limits(&self, inputs: Vec<PyObject>, limits: ResourceLimits) -> Result<PyObject, RunError> {
         let tracker = LimitedTracker::new(limits);
         self.run_with_tracker(inputs, tracker)
     }
@@ -112,22 +113,18 @@ impl<'c> Executor<'c> {
     ///
     /// # Type Parameters
     /// * `T` - A type implementing `ResourceTracker`
-    fn run_with_tracker<T: ResourceTracker>(
-        &self,
-        inputs: Vec<PyObject>,
-        tracker: T,
-    ) -> Result<PyObject, RunError<'c>> {
+    fn run_with_tracker<T: ResourceTracker>(&self, inputs: Vec<PyObject>, tracker: T) -> Result<PyObject, RunError> {
         let mut heap = Heap::new(self.namespace_size, tracker);
-        let mut namespaces = self.prepare_namespaces(inputs, &mut heap)?;
+        let mut namespaces = self.prepare_namespaces(inputs, &mut heap, &self.interns)?;
 
-        let frame = RunFrame::new();
+        let frame = RunFrame::module_frame(&self.interns);
         let result = frame.execute(&mut namespaces, &mut heap, &self.nodes);
 
         // Clean up the global namespace before returning (only needed with dec-ref-check)
         #[cfg(feature = "dec-ref-check")]
         namespaces.drop_global_with_heap(&mut heap);
 
-        result.map(|frame_exit| PyObject::new(frame_exit, &mut heap))
+        result.map(|frame_exit| PyObject::new(frame_exit, &mut heap, &self.interns))
     }
 
     /// Executes the code and returns both the result and reference count data.
@@ -144,23 +141,23 @@ impl<'c> Executor<'c> {
     ///
     /// Only available when the `ref-counting` feature is enabled.
     #[cfg(feature = "ref-counting")]
-    pub fn run_ref_counts(&self, inputs: Vec<PyObject>) -> RunRefCountsResult<'c> {
+    pub fn run_ref_counts(&self, inputs: Vec<PyObject>) -> RunRefCountsResult {
         use crate::value::Value;
         use std::collections::HashSet;
 
         let mut heap = Heap::new(self.namespace_size, NoLimitTracker::default());
-        let mut namespaces = self.prepare_namespaces(inputs, &mut heap)?;
+        let mut namespaces = self.prepare_namespaces(inputs, &mut heap, &self.interns)?;
 
-        let frame = RunFrame::new();
+        let frame = RunFrame::module_frame(&self.interns);
         let result = frame.execute(&mut namespaces, &mut heap, &self.nodes);
 
         // Compute ref counts before consuming the heap
         let final_namespace = namespaces.into_global();
-        let mut counts = AHashMap::new();
+        let mut counts = ahash::AHashMap::new();
         let mut unique_ids = HashSet::new();
 
-        for (name, &index) in &self.name_map {
-            if let Some(Value::Ref(id)) = final_namespace.get(index) {
+        for (name, &namespace_id) in &self.name_map {
+            if let Some(Value::Ref(id)) = final_namespace.get_opt(namespace_id) {
                 counts.insert(name.clone(), heap.get_refcount(*id));
                 unique_ids.insert(*id);
             }
@@ -172,7 +169,7 @@ impl<'c> Executor<'c> {
             obj.drop_with_heap(&mut heap);
         }
 
-        let python_value = result.map(|frame_exit| PyObject::new(frame_exit, &mut heap))?;
+        let python_value = result.map(|frame_exit| PyObject::new(frame_exit, &mut heap, &self.interns))?;
 
         Ok((python_value, ref_count_data))
     }
@@ -181,20 +178,21 @@ impl<'c> Executor<'c> {
     ///
     /// Converts each `PyObject` input to a `Value`, allocating on the heap if needed.
     /// Returns the prepared Namespaces or an error if there are too many inputs or invalid input types.
-    fn prepare_namespaces<'e, T: ResourceTracker>(
+    fn prepare_namespaces<T: ResourceTracker>(
         &self,
         inputs: Vec<PyObject>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> Result<Namespaces<'c, 'e>, InternalRunError> {
+        heap: &mut Heap<T>,
+        interns: &Interns,
+    ) -> Result<Namespaces, InternalRunError> {
         let Some(extra) = self.namespace_size.checked_sub(inputs.len()) else {
             return Err(InternalRunError::Error(
                 format!("input length should be <= {}", self.namespace_size).into(),
             ));
         };
         // Convert each PyObject to a Value, propagating any invalid input errors
-        let mut namespace: Vec<Value<'c, 'e>> = inputs
+        let mut namespace: Vec<Value> = inputs
             .into_iter()
-            .map(|pv| pv.to_value(heap))
+            .map(|pv| pv.to_value(heap, interns))
             .collect::<Result<_, _>>()
             .map_err(|e| InternalRunError::Error(e.to_string().into()))?;
         if extra > 0 {
@@ -214,8 +212,8 @@ pub fn parse_show(code: &str, filename: &str) -> Result<String, String> {
 
 #[cfg(feature = "ref-counting")]
 /// Aggregated reference counting statistics returned by `Executor::run_ref_counts`.
-type RefCountSnapshot = (AHashMap<String, usize>, usize, usize);
+type RefCountSnapshot = (ahash::AHashMap<String, usize>, usize, usize);
 
 #[cfg(feature = "ref-counting")]
 /// Result type used by `Executor::run_ref_counts`.
-type RunRefCountsResult<'c> = Result<(PyObject, RefCountSnapshot), RunError<'c>>;
+type RunRefCountsResult = Result<(PyObject, RefCountSnapshot), RunError>;

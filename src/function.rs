@@ -1,4 +1,3 @@
-use std::fmt;
 use std::fmt::Write;
 
 use crate::{
@@ -6,11 +5,11 @@ use crate::{
     exceptions::{ExcType, SimpleException, StackFrame},
     expressions::{FrameExit, Identifier, Node},
     heap::{Heap, HeapId},
-    namespace::Namespaces,
+    intern::{Interns, StringId},
+    namespace::{NamespaceId, Namespaces},
     resource::ResourceTracker,
     run::{RunFrame, RunResult},
-    value::{heap_tagged_id, Value},
-    values::str::string_repr,
+    value::Value,
 };
 
 /// Stores a function definition.
@@ -38,20 +37,20 @@ use crate::{
 /// - `cell_var_count`: Number of cells to create for variables captured by nested functions.
 ///   At call time, cells are created and pushed sequentially after params.
 #[derive(Debug, Clone)]
-pub(crate) struct Function<'c> {
+pub struct Function {
     /// The function name (used for error messages and repr).
-    pub name: Identifier<'c>,
-    /// The function parameters (used for error message).
-    pub params: Vec<&'c str>,
+    pub name: Identifier,
+    /// The function parameter names as interned StringIds.
+    pub params: Vec<StringId>,
     /// The prepared function body AST nodes.
-    pub body: Vec<Node<'c>>,
+    pub body: Vec<Node>,
     /// Size of the initial namespace (number of local variable slots).
     pub namespace_size: usize,
     /// Enclosing namespace slots for variables captured from enclosing scopes.
     ///
     /// At definition time: look up cell HeapId from enclosing namespace at each slot.
     /// At call time: captured cells are pushed sequentially (our slots are implicit).
-    pub free_var_enclosing_slots: Vec<usize>,
+    pub free_var_enclosing_slots: Vec<NamespaceId>,
     /// Number of cell variables (captured by nested functions).
     ///
     /// At call time, this many cells are created and pushed right after params.
@@ -59,28 +58,22 @@ pub(crate) struct Function<'c> {
     pub cell_var_count: usize,
 }
 
-impl fmt::Display for Function<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name.name)
-    }
-}
-
-impl<'c> Function<'c> {
+impl Function {
     /// Create a new function definition.
     ///
     /// # Arguments
     /// * `name` - The function name identifier
-    /// * `params` - The parameter names
+    /// * `params` - The parameter names as interned StringIds
     /// * `body` - The prepared function body AST
     /// * `namespace_size` - Number of local variable slots needed
     /// * `free_var_enclosing_slots` - Enclosing namespace slots for captured variables
     /// * `cell_var_count` - Number of cells to create for variables captured by nested functions
     pub fn new(
-        name: Identifier<'c>,
-        params: Vec<&'c str>,
-        body: Vec<Node<'c>>,
+        name: Identifier,
+        params: Vec<StringId>,
+        body: Vec<Node>,
         namespace_size: usize,
-        free_var_enclosing_slots: Vec<usize>,
+        free_var_enclosing_slots: Vec<NamespaceId>,
         cell_var_count: usize,
     ) -> Self {
         Self {
@@ -99,6 +92,13 @@ impl<'c> Function<'c> {
         !self.free_var_enclosing_slots.is_empty()
     }
 
+    /// Returns true if this function is equal to another function.
+    ///
+    /// We assume functions are equal if they have the same name and position.
+    pub fn py_eq(&self, other: &Self) -> bool {
+        self.name.py_eq(&other.name)
+    }
+
     /// Calls this function with the given arguments.
     ///
     /// This method is used for non-closure functions. For closures (functions with
@@ -108,22 +108,21 @@ impl<'c> Function<'c> {
     /// * `namespaces` - The namespace storage for managing all namespaces
     /// * `heap` - The heap for allocating objects
     /// * `args` - The arguments to pass to the function
-    pub fn call<'e, T: ResourceTracker>(
-        &'e self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        args: ArgValues<'c, 'e>,
-    ) -> RunResult<'c, Value<'c, 'e>>
-    where
-        'c: 'e,
-    {
+    /// * `interns` - String storage for looking up interned names in error messages
+    pub fn call<T: ResourceTracker>(
+        &self,
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        args: ArgValues,
+        interns: &Interns,
+    ) -> RunResult<Value> {
         // Build namespace sequentially: [params][cell_vars][free_vars][locals]
         let mut namespace = Vec::with_capacity(self.namespace_size);
 
         // 1. Push arguments (slots 0..params.len())
         args.inject_into_namespace(&mut namespace);
         if namespace.len() != self.params.len() {
-            return self.wrong_arg_count_error(namespace.len());
+            return self.wrong_arg_count_error(namespace.len(), interns);
         }
 
         // 2. Push cell_var refs (slots params.len()..params.len()+cell_var_count)
@@ -142,10 +141,10 @@ impl<'c> Function<'c> {
         let local_idx = namespaces.push(namespace);
 
         // Create stack frame for error tracebacks
-        let parent_frame = StackFrame::new(&self.name.position, self.name.name, None);
+        let parent_frame = StackFrame::new(self.name.position, self.name.name_id, None);
 
         // Execute the function body in a new frame
-        let frame = RunFrame::new_for_function(local_idx, self.name.name, Some(parent_frame));
+        let frame = RunFrame::function_frame(local_idx, self.name.name_id, Some(parent_frame), interns);
 
         let result = frame.execute(namespaces, heap, &self.body);
 
@@ -165,26 +164,25 @@ impl<'c> Function<'c> {
     /// * `heap` - The heap for allocating objects
     /// * `args` - The arguments to pass to the function
     /// * `captured_cells` - Cell HeapIds captured from the enclosing scope
+    /// * `interns` - String storage for looking up interned names in error messages
     ///
     /// This method is called when invoking a `Value::Closure`. The captured_cells
     /// are pushed sequentially after cell_vars in the namespace.
-    pub fn call_with_cells<'e, T: ResourceTracker>(
-        &'e self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-        args: ArgValues<'c, 'e>,
+    pub fn call_with_cells<T: ResourceTracker>(
+        &self,
+        namespaces: &mut Namespaces,
+        heap: &mut Heap<T>,
+        args: ArgValues,
         captured_cells: &[HeapId],
-    ) -> RunResult<'c, Value<'c, 'e>>
-    where
-        'c: 'e,
-    {
+        interns: &Interns,
+    ) -> RunResult<Value> {
         // Build namespace sequentially: [params][cell_vars][free_vars][locals]
         let mut namespace = Vec::with_capacity(self.namespace_size);
 
         // 1. Push arguments (slots 0..params.len())
         args.inject_into_namespace(&mut namespace);
         if namespace.len() != self.params.len() {
-            return self.wrong_arg_count_error(namespace.len());
+            return self.wrong_arg_count_error(namespace.len(), interns);
         }
 
         // 2. Push cell_var refs (slots params.len()..params.len()+cell_var_count)
@@ -208,10 +206,10 @@ impl<'c> Function<'c> {
         let local_idx = namespaces.push(namespace);
 
         // Create stack frame for error tracebacks
-        let parent_frame = StackFrame::new(&self.name.position, self.name.name, None);
+        let parent_frame = StackFrame::new(self.name.position, self.name.name_id, None);
 
         // Execute the function body in a new frame
-        let frame = RunFrame::new_for_function(local_idx, self.name.name, Some(parent_frame));
+        let frame = RunFrame::function_frame(local_idx, self.name.name_id, Some(parent_frame), interns);
 
         let result = frame.execute(namespaces, heap, &self.body);
 
@@ -225,32 +223,42 @@ impl<'c> Function<'c> {
     }
 
     /// Writes the Python repr() string for this function to a formatter.
-    pub fn py_repr_fmt<W: Write>(&self, f: &mut W) -> std::fmt::Result {
-        write!(f, "<function '{}' at 0x{:x}>", self, self.id())
-    }
-
-    pub fn id(&self) -> usize {
-        heap_tagged_id(self.name.heap_id())
+    pub fn py_repr_fmt<W: Write>(
+        &self,
+        f: &mut W,
+        interns: &Interns,
+        // TODO use actual heap_id
+        heap_id: usize,
+    ) -> std::fmt::Result {
+        write!(
+            f,
+            "<function '{}' at 0x{:x}>",
+            interns.get_str(self.name.name_id),
+            heap_id
+        )
     }
 
     /// Creates an error for wrong number of arguments.
     ///
     /// Handles both "missing required positional arguments" and "too many arguments" cases,
     /// formatting the error message to match CPython's style.
-    fn wrong_arg_count_error<'e>(&self, actual_count: usize) -> RunResult<'c, Value<'c, 'e>> {
+    ///
+    /// # Arguments
+    /// * `actual_count` - Number of arguments actually provided
+    /// * `interns` - String storage for looking up interned names
+    fn wrong_arg_count_error(&self, actual_count: usize, interns: &Interns) -> RunResult<Value> {
+        let func_name = interns.get_str(self.name.name_id);
         let msg = if let Some(missing_count) = self.params.len().checked_sub(actual_count) {
-            // Missing arguments
+            // Missing arguments - show actual parameter names
             let mut msg = format!(
                 "{}() missing {} required positional argument{}: ",
-                self.name.name,
+                func_name,
                 missing_count,
                 if missing_count == 1 { "" } else { "s" }
             );
-            let mut missing_names: Vec<_> = self
-                .params
+            let mut missing_names: Vec<_> = self.params[actual_count..]
                 .iter()
-                .skip(actual_count)
-                .map(|param| string_repr(param))
+                .map(|string_id| format!("'{}'", interns.get_str(*string_id)))
                 .collect();
             let last = missing_names.pop().unwrap();
             if !missing_names.is_empty() {
@@ -263,14 +271,14 @@ impl<'c> Function<'c> {
             // Too many arguments
             format!(
                 "{}() takes {} positional argument{} but {} {} given",
-                self.name.name,
+                func_name,
                 self.params.len(),
                 if self.params.len() == 1 { "" } else { "s" },
                 actual_count,
                 if actual_count == 1 { "was" } else { "were" }
             )
         };
-        Err(SimpleException::new(ExcType::TypeError, Some(msg.into()))
+        Err(SimpleException::new(ExcType::TypeError, Some(msg))
             .with_position(self.name.position)
             .into())
     }

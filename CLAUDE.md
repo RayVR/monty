@@ -134,6 +134,7 @@ Ask for approval before using `skip`!
 ### Other Notes
 
 - Prefer single quotes for strings in Python tests
+- do NOT add `# noqa` comments to test code, instead add the failing code to `pyproject.toml`
 - Run `make lint-py` after adding tests
 - Use `make complete-tests` to fill in blank expectations
 - Tests run via `datatest-stable` harness in `tests/datatest_runner.rs`

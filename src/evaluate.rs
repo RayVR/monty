@@ -4,8 +4,10 @@ use crate::args::{ArgExprs, ArgValues};
 use crate::exceptions::{internal_err, InternalRunError, SimpleException};
 use crate::expressions::{Expr, ExprLoc, Identifier, NameScope};
 use crate::fstring::{fstring_interpolation, FStringPart};
+
 use crate::heap::{Heap, HeapData};
-use crate::namespace::Namespaces;
+use crate::intern::Interns;
+use crate::namespace::{NamespaceId, Namespaces};
 use crate::operators::{CmpOperator, Operator};
 use crate::resource::ResourceTracker;
 use crate::run::RunResult;
@@ -14,41 +16,46 @@ use crate::values::{Dict, List, PyTrait, Str};
 
 /// Container for evaluation context that holds all state needed during expression evaluation.
 ///
-/// This struct bundles together the namespaces, local namespace index, and heap
+/// This struct bundles together the namespaces, local namespace index, heap, and string storage
 /// to avoid passing them as separate parameters to every evaluation function.
 /// It simplifies function signatures and makes the evaluation code more readable.
 ///
 /// # Lifetimes
-/// * `'c` - Lifetime of the code/AST (compile-time data)
-/// * `'e` - Lifetime of expressions
 /// * `'h` - Lifetime of the mutable borrows (namespaces and heap)
+/// * `'s` - Lifetime of the string storage
 ///
 /// # Type Parameters
 /// * `T` - The resource tracker type for enforcing execution limits
-pub struct EvaluateExpr<'c, 'e, 'h, T: ResourceTracker> {
+pub struct EvaluateExpr<'h, 's, T: ResourceTracker> {
     /// The namespace stack containing all scopes (global, local, etc.)
-    pub namespaces: &'h mut Namespaces<'c, 'e>,
+    pub namespaces: &'h mut Namespaces,
     /// Index of the current local namespace in the namespace stack
-    pub local_idx: usize,
+    pub local_idx: NamespaceId,
     /// The heap for allocating and managing heap-allocated objects
-    pub heap: &'h mut Heap<'c, 'e, T>,
+    pub heap: &'h mut Heap<T>,
+    /// String storage for looking up interned names
+    pub interns: &'s Interns,
 }
 
-impl<'c, 'e, 'h, T: ResourceTracker> EvaluateExpr<'c, 'e, 'h, T>
-where
-    'c: 'e,
-{
+impl<'h, 's, T: ResourceTracker> EvaluateExpr<'h, 's, T> {
     /// Creates a new `EvaluateExpr` with the given evaluation context.
     ///
     /// # Arguments
     /// * `namespaces` - The namespace stack containing all scopes
     /// * `local_idx` - Index of the current local namespace
     /// * `heap` - The heap for object allocation
-    pub fn new(namespaces: &'h mut Namespaces<'c, 'e>, local_idx: usize, heap: &'h mut Heap<'c, 'e, T>) -> Self {
+    /// * `interns` - String storage for looking up interned names
+    pub fn new(
+        namespaces: &'h mut Namespaces,
+        local_idx: NamespaceId,
+        heap: &'h mut Heap<T>,
+        interns: &'s Interns,
+    ) -> Self {
         Self {
             namespaces,
             local_idx,
             heap,
+            interns,
         }
     }
 
@@ -57,14 +64,16 @@ where
     /// This is the primary evaluation method that recursively evaluates expressions
     /// and returns the resulting value. The returned value may be a heap reference
     /// that the caller is responsible for dropping via `drop_with_heap`.
-    pub fn evaluate_use(&mut self, expr_loc: &'e ExprLoc<'c>) -> RunResult<'c, Value<'c, 'e>> {
+    pub fn evaluate_use(&mut self, expr_loc: &ExprLoc) -> RunResult<Value> {
         match &expr_loc.expr {
-            Expr::Literal(literal) => Ok(literal.to_value()),
-            Expr::Callable(callable) => Ok(callable.to_value()),
-            Expr::Name(ident) => self.namespaces.get_var_value(self.local_idx, self.heap, ident),
+            Expr::Literal(literal) => Ok((*literal).into()),
+            Expr::Builtin(builtins) => Ok(Value::Builtin(*builtins)),
+            Expr::Name(ident) => self
+                .namespaces
+                .get_var_value(self.local_idx, self.heap, ident, self.interns),
             Expr::Call { callable, args } => {
                 let args = self.evaluate_args(args)?;
-                callable.call(self.namespaces, self.local_idx, self.heap, args)
+                callable.call(self.namespaces, self.local_idx, self.heap, args, self.interns)
             }
             Expr::AttrCall { object, attr, args } => Ok(self.attr_call(object, attr, args)?),
             Expr::Op { left, op, right } => match op {
@@ -94,7 +103,7 @@ where
             Expr::Subscript { object, index } => {
                 let obj = self.evaluate_use(object)?;
                 let key = self.evaluate_use(index)?;
-                let result = obj.py_getitem(&key, self.heap);
+                let result = obj.py_getitem(&key, self.heap, self.interns);
                 // Drop temporary references to object and key
                 obj.drop_with_heap(self.heap);
                 key.drop_with_heap(self.heap);
@@ -107,13 +116,13 @@ where
                     let value = self.evaluate_use(value_expr)?;
                     eval_pairs.push((key, value));
                 }
-                let dict = Dict::from_pairs(eval_pairs, self.heap)?;
+                let dict = Dict::from_pairs(eval_pairs, self.heap, self.interns)?;
                 let dict_id = self.heap.allocate(HeapData::Dict(dict))?;
                 Ok(Value::Ref(dict_id))
             }
             Expr::Not(operand) => {
                 let val = self.evaluate_use(operand)?;
-                let result = !val.py_bool(self.heap);
+                let result = !val.py_bool(self.heap, self.interns);
                 val.drop_with_heap(self.heap);
                 Ok(Value::Bool(result))
             }
@@ -151,30 +160,33 @@ where
     /// This is an optimization for statement expressions where the result
     /// is not needed. It avoids unnecessary allocations in some cases
     /// (e.g., pure literals) while still evaluating side effects.
-    pub fn evaluate_discard(&mut self, expr_loc: &'e ExprLoc<'c>) -> RunResult<'c, ()> {
+    pub fn evaluate_discard(&mut self, expr_loc: &ExprLoc) -> RunResult<()> {
         match &expr_loc.expr {
             // TODO, is this right for callable?
-            Expr::Literal(_) | Expr::Callable(_) => Ok(()),
+            Expr::Literal(_) | Expr::Builtin(_) => Ok(()),
             Expr::Name(ident) => {
                 // For discard, we just need to verify the variable exists
                 match ident.scope {
                     NameScope::Cell => {
                         // Cell variable - look up from namespace and verify it's a cell
                         let namespace = self.namespaces.get(self.local_idx);
-                        if let Value::Ref(cell_id) = namespace[ident.heap_id()] {
+                        if let Value::Ref(cell_id) = namespace.get(ident.namespace_id()) {
                             // Just verify we can access it - don't need the value
-                            let _ = self.heap.get_cell_value_ref(cell_id);
+                            let _ = self.heap.get_cell_value_ref(*cell_id);
                             Ok(())
                         } else {
                             panic!("Cell variable slot doesn't contain a cell reference - prepare-time bug");
                         }
                     }
-                    _ => self.namespaces.get_var_mut(self.local_idx, ident).map(|_| ()),
+                    _ => self
+                        .namespaces
+                        .get_var_mut(self.local_idx, ident, self.interns)
+                        .map(|_| ()),
                 }
             }
             Expr::Call { callable, args } => {
                 let args = self.evaluate_args(args)?;
-                let result = callable.call(self.namespaces, self.local_idx, self.heap, args)?;
+                let result = callable.call(self.namespaces, self.local_idx, self.heap, args, self.interns)?;
                 result.drop_with_heap(self.heap);
                 Ok(())
             }
@@ -244,13 +256,13 @@ where
     /// directly rather than a `Value`. It includes optimizations for
     /// comparison operators, `not`, and `and`/`or` to avoid creating
     /// intermediate `Value::Bool` objects.
-    pub fn evaluate_bool(&mut self, expr_loc: &'e ExprLoc<'c>) -> RunResult<'c, bool> {
+    pub fn evaluate_bool(&mut self, expr_loc: &ExprLoc) -> RunResult<bool> {
         match &expr_loc.expr {
             Expr::CmpOp { left, op, right } => self.cmp_op(left, op, right),
             // Optimize `not` to avoid creating intermediate Value::Bool
             Expr::Not(operand) => {
                 let val = self.evaluate_use(operand)?;
-                let result = !val.py_bool(self.heap);
+                let result = !val.py_bool(self.heap, self.interns);
                 val.drop_with_heap(self.heap);
                 Ok(result)
             }
@@ -261,13 +273,13 @@ where
                     Operator::Or => self.eval_or(left, right)?,
                     _ => unreachable!(),
                 };
-                let bool_result = result.py_bool(self.heap);
+                let bool_result = result.py_bool(self.heap, self.interns);
                 result.drop_with_heap(self.heap);
                 Ok(bool_result)
             }
             _ => {
                 let obj = self.evaluate_use(expr_loc)?;
-                let result = obj.py_bool(self.heap);
+                let result = obj.py_bool(self.heap, self.interns);
                 // Drop temporary reference
                 obj.drop_with_heap(self.heap);
                 Ok(result)
@@ -275,24 +287,15 @@ where
         }
     }
 
-    pub fn heap(&mut self) -> &mut Heap<'c, 'e, T> {
-        self.heap
-    }
-
     /// Evaluates a binary operator expression (`+, -, %`, etc.).
-    fn eval_op(
-        &mut self,
-        left: &'e ExprLoc<'c>,
-        op: &Operator,
-        right: &'e ExprLoc<'c>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+    fn eval_op(&mut self, left: &ExprLoc, op: &Operator, right: &ExprLoc) -> RunResult<Value> {
         let lhs = self.evaluate_use(left)?;
         let rhs = self.evaluate_use(right)?;
         let op_result: Option<Value> = match op {
-            Operator::Add => lhs.py_add(&rhs, self.heap)?,
+            Operator::Add => lhs.py_add(&rhs, self.heap, self.interns)?,
             Operator::Sub => lhs.py_sub(&rhs, self.heap)?,
             Operator::Mod => lhs.py_mod(&rhs),
-            Operator::Mult => lhs.py_mult(&rhs, self.heap)?,
+            Operator::Mult => lhs.py_mult(&rhs, self.heap, self.interns)?,
             Operator::Div => lhs.py_div(&rhs, self.heap)?,
             Operator::FloorDiv => lhs.py_floordiv(&rhs, self.heap)?,
             Operator::Pow => lhs.py_pow(&rhs, self.heap)?,
@@ -321,9 +324,9 @@ where
     /// Evaluates the `and` operator with short-circuit evaluation.
     ///
     /// Returns the first falsy value encountered, or the last value if all are truthy.
-    fn eval_and(&mut self, left: &'e ExprLoc<'c>, right: &'e ExprLoc<'c>) -> RunResult<'c, Value<'c, 'e>> {
+    fn eval_and(&mut self, left: &ExprLoc, right: &ExprLoc) -> RunResult<Value> {
         let lhs = self.evaluate_use(left)?;
-        if lhs.py_bool(self.heap) {
+        if lhs.py_bool(self.heap, self.interns) {
             // Drop left operand since we're returning the right one
             lhs.drop_with_heap(self.heap);
             self.evaluate_use(right)
@@ -336,9 +339,9 @@ where
     /// Evaluates the `or` operator with short-circuit semantics.
     ///
     /// Returns the first truthy value encountered, or the last value if all are falsy.
-    fn eval_or(&mut self, left: &'e ExprLoc<'c>, right: &'e ExprLoc<'c>) -> RunResult<'c, Value<'c, 'e>> {
+    fn eval_or(&mut self, left: &ExprLoc, right: &ExprLoc) -> RunResult<Value> {
         let lhs = self.evaluate_use(left)?;
-        if lhs.py_bool(self.heap) {
+        if lhs.py_bool(self.heap, self.interns) {
             // Short-circuit: return the truthy left operand
             Ok(lhs)
         } else {
@@ -353,17 +356,17 @@ where
     /// Comparisons always return bool because Python chained comparisons
     /// (e.g., `1 < x < 10`) would need the intermediate value, but we don't
     /// support chaining yet, so we can return bool directly.
-    fn cmp_op(&mut self, left: &'e ExprLoc<'c>, op: &CmpOperator, right: &'e ExprLoc<'c>) -> RunResult<'c, bool> {
+    fn cmp_op(&mut self, left: &ExprLoc, op: &CmpOperator, right: &ExprLoc) -> RunResult<bool> {
         let lhs = self.evaluate_use(left)?;
         let rhs = self.evaluate_use(right)?;
 
         let result = match op {
-            CmpOperator::Eq => Some(lhs.py_eq(&rhs, self.heap)),
-            CmpOperator::NotEq => Some(!lhs.py_eq(&rhs, self.heap)),
-            CmpOperator::Gt => lhs.py_cmp(&rhs, self.heap).map(Ordering::is_gt),
-            CmpOperator::GtE => lhs.py_cmp(&rhs, self.heap).map(Ordering::is_ge),
-            CmpOperator::Lt => lhs.py_cmp(&rhs, self.heap).map(Ordering::is_lt),
-            CmpOperator::LtE => lhs.py_cmp(&rhs, self.heap).map(Ordering::is_le),
+            CmpOperator::Eq => Some(lhs.py_eq(&rhs, self.heap, self.interns)),
+            CmpOperator::NotEq => Some(!lhs.py_eq(&rhs, self.heap, self.interns)),
+            CmpOperator::Gt => lhs.py_cmp(&rhs, self.heap, self.interns).map(Ordering::is_gt),
+            CmpOperator::GtE => lhs.py_cmp(&rhs, self.heap, self.interns).map(Ordering::is_ge),
+            CmpOperator::Lt => lhs.py_cmp(&rhs, self.heap, self.interns).map(Ordering::is_lt),
+            CmpOperator::LtE => lhs.py_cmp(&rhs, self.heap, self.interns).map(Ordering::is_le),
             CmpOperator::Is => Some(lhs.is(&rhs)),
             CmpOperator::IsNot => Some(!lhs.is(&rhs)),
             CmpOperator::ModEq(v) => lhs.py_mod_eq(&rhs, *v),
@@ -388,30 +391,27 @@ where
     ///
     /// This evaluates `object`, looks up `attr`, calls the method with `args`,
     /// and handles proper cleanup of temporary values.
-    fn attr_call(
-        &mut self,
-        object_ident: &Identifier<'c>,
-        attr: &Attr,
-        args: &'e ArgExprs<'c>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+    fn attr_call(&mut self, object_ident: &Identifier, attr: &Attr, args: &ArgExprs) -> RunResult<Value> {
         // Evaluate arguments first to avoid borrow conflicts
         let args = self.evaluate_args(args)?;
 
         // For Cell scope, look up the cell from the namespace and dereference
         if let NameScope::Cell = object_ident.scope {
             let namespace = self.namespaces.get(self.local_idx);
-            let Value::Ref(cell_id) = namespace[object_ident.heap_id()] else {
+            let Value::Ref(cell_id) = namespace.get(object_ident.namespace_id()) else {
                 panic!("Cell variable slot doesn't contain a cell reference - prepare-time bug")
             };
             // get_cell_value already handles refcount increment
-            let mut cell_value = self.heap.get_cell_value(cell_id);
-            let result = cell_value.call_attr(self.heap, attr, args);
+            let mut cell_value = self.heap.get_cell_value(*cell_id);
+            let result = cell_value.call_attr(self.heap, attr, args, self.interns);
             cell_value.drop_with_heap(self.heap);
             result
         } else {
             // For normal scopes, use get_var_mut
-            let object = self.namespaces.get_var_mut(self.local_idx, object_ident)?;
-            object.call_attr(self.heap, attr, args)
+            let object = self
+                .namespaces
+                .get_var_mut(self.local_idx, object_ident, self.interns)?;
+            object.call_attr(self.heap, attr, args, self.interns)
         }
     }
 
@@ -423,7 +423,7 @@ where
     ///
     /// Reference counting: Intermediate values are properly dropped after formatting.
     /// The final result is a new heap-allocated string.
-    fn evaluate_fstring(&mut self, parts: &'e [FStringPart<'c>]) -> RunResult<'c, Value<'c, 'e>> {
+    fn evaluate_fstring(&mut self, parts: &[FStringPart]) -> RunResult<Value> {
         let mut result = String::new();
 
         for part in parts {
@@ -455,7 +455,7 @@ where
     }
 
     /// Evaluates function call arguments from expressions to values.
-    fn evaluate_args(&mut self, args_expr: &'e ArgExprs<'c>) -> RunResult<'c, ArgValues<'c, 'e>> {
+    fn evaluate_args(&mut self, args_expr: &ArgExprs) -> RunResult<ArgValues> {
         match args_expr {
             ArgExprs::Zero => Ok(ArgValues::Zero),
             ArgExprs::One(arg) => self.evaluate_use(arg).map(ArgValues::One),

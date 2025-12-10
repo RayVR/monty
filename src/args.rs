@@ -1,5 +1,3 @@
-use std::fmt::{self, Write};
-
 use crate::{
     exceptions::ExcType,
     expressions::{ExprLoc, Identifier},
@@ -14,17 +12,17 @@ use crate::{
 /// Most Python method calls have at most 2 arguments, so this optimization
 /// eliminates the Vec heap allocation overhead for the vast majority of calls.
 #[derive(Debug)]
-pub enum ArgValues<'c, 'e> {
+pub enum ArgValues {
     Zero,
-    One(Value<'c, 'e>),
-    Two(Value<'c, 'e>, Value<'c, 'e>),
-    Many(Vec<Value<'c, 'e>>),
+    One(Value),
+    Two(Value, Value),
+    Many(Vec<Value>),
     // TODO kwarg types
 }
 
-impl<'c, 'e> ArgValues<'c, 'e> {
+impl ArgValues {
     /// Checks that zero arguments were passed.
-    pub fn check_zero_args(&self, name: &str) -> RunResult<'static, ()> {
+    pub fn check_zero_args(&self, name: &str) -> RunResult<()> {
         match self {
             Self::Zero => Ok(()),
             _ => Err(ExcType::type_error_no_args(name, self.count())),
@@ -32,7 +30,7 @@ impl<'c, 'e> ArgValues<'c, 'e> {
     }
 
     /// Checks that exactly one argument was passed, returning it.
-    pub fn get_one_arg(self, name: &str) -> RunResult<'static, Value<'c, 'e>> {
+    pub fn get_one_arg(self, name: &str) -> RunResult<Value> {
         match self {
             Self::One(a) => Ok(a),
             _ => Err(ExcType::type_error_arg_count(name, 1, self.count())),
@@ -40,7 +38,7 @@ impl<'c, 'e> ArgValues<'c, 'e> {
     }
 
     /// Checks that exactly two arguments were passed, returning them as a tuple.
-    pub fn get_two_args(self, name: &str) -> RunResult<'static, (Value<'c, 'e>, Value<'c, 'e>)> {
+    pub fn get_two_args(self, name: &str) -> RunResult<(Value, Value)> {
         match self {
             Self::Two(a1, a2) => Ok((a1, a2)),
             _ => Err(ExcType::type_error_arg_count(name, 2, self.count())),
@@ -48,7 +46,7 @@ impl<'c, 'e> ArgValues<'c, 'e> {
     }
 
     /// Checks that one or two arguments were passed, returning them as a tuple.
-    pub fn get_one_two_args(self, name: &str) -> RunResult<'static, (Value<'c, 'e>, Option<Value<'c, 'e>>)> {
+    pub fn get_one_two_args(self, name: &str) -> RunResult<(Value, Option<Value>)> {
         match self {
             Self::One(a) => Ok((a, None)),
             Self::Two(a1, a2) => Ok((a1, Some(a2))),
@@ -58,7 +56,7 @@ impl<'c, 'e> ArgValues<'c, 'e> {
     }
 
     /// Create a new namespace for a function arguments
-    pub fn inject_into_namespace(self, namespace: &mut Vec<Value<'c, 'e>>) {
+    pub fn inject_into_namespace(self, namespace: &mut Vec<Value>) {
         match self {
             Self::Zero => (),
             Self::One(a) => {
@@ -85,28 +83,26 @@ impl<'c, 'e> ArgValues<'c, 'e> {
     }
 }
 
+/// A keyword argument in a function call expression.
 #[derive(Debug, Clone)]
-pub struct Kwarg<'c> {
-    pub key: Identifier<'c>,
-    pub value: ExprLoc<'c>,
+pub struct Kwarg {
+    pub key: Identifier,
+    pub value: ExprLoc,
 }
 
 /// Expressions that make up a function call's arguments.
 #[derive(Debug, Clone)]
-pub enum ArgExprs<'c> {
+pub enum ArgExprs {
     Zero,
-    One(Box<ExprLoc<'c>>),
-    Two(Box<ExprLoc<'c>>, Box<ExprLoc<'c>>),
-    Args(Vec<ExprLoc<'c>>),
-    Kwargs(Vec<Kwarg<'c>>),
-    ArgsKargs {
-        args: Vec<ExprLoc<'c>>,
-        kwargs: Vec<Kwarg<'c>>,
-    },
+    One(Box<ExprLoc>),
+    Two(Box<ExprLoc>, Box<ExprLoc>),
+    Args(Vec<ExprLoc>),
+    Kwargs(Vec<Kwarg>),
+    ArgsKargs { args: Vec<ExprLoc>, kwargs: Vec<Kwarg> },
 }
 
-impl<'c> ArgExprs<'c> {
-    pub fn new(args: Vec<ExprLoc<'c>>, kwargs: Vec<Kwarg<'c>>) -> Self {
+impl ArgExprs {
+    pub fn new(args: Vec<ExprLoc>, kwargs: Vec<Kwarg>) -> Self {
         if !kwargs.is_empty() {
             if args.is_empty() {
                 Self::Kwargs(kwargs)
@@ -135,8 +131,8 @@ impl<'c> ArgExprs<'c> {
     /// argument expressions before execution.
     pub fn prepare_args(
         &mut self,
-        mut f: impl FnMut(ExprLoc<'c>) -> Result<ExprLoc<'c>, ParseError<'c>>,
-    ) -> Result<(), ParseError<'c>> {
+        mut f: impl FnMut(ExprLoc) -> Result<ExprLoc, ParseError>,
+    ) -> Result<(), ParseError> {
         // Swap self with Empty to take ownership, then rebuild
         let taken = std::mem::replace(self, Self::Zero);
         *self = match taken {
@@ -153,13 +149,10 @@ impl<'c> ArgExprs<'c> {
                             value: f(kwarg.value)?,
                         })
                     })
-                    .collect::<Result<Vec<_>, ParseError<'c>>>()?,
+                    .collect::<Result<Vec<_>, ParseError>>()?,
             ),
             Self::ArgsKargs { args, kwargs } => {
-                let args = args
-                    .into_iter()
-                    .map(&mut f)
-                    .collect::<Result<Vec<_>, ParseError<'c>>>()?;
+                let args = args.into_iter().map(&mut f).collect::<Result<Vec<_>, ParseError>>()?;
                 let kwargs = kwargs
                     .into_iter()
                     .map(|kwarg| {
@@ -168,52 +161,10 @@ impl<'c> ArgExprs<'c> {
                             value: f(kwarg.value)?,
                         })
                     })
-                    .collect::<Result<Vec<_>, ParseError<'c>>>()?;
+                    .collect::<Result<Vec<_>, ParseError>>()?;
                 Self::ArgsKargs { args, kwargs }
             }
         };
         Ok(())
-    }
-}
-
-impl fmt::Display for ArgExprs<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_char('(')?;
-        match self {
-            Self::Zero => {}
-            Self::One(arg) => write!(f, "{arg}")?,
-            Self::Two(arg1, arg2) => write!(f, "{arg1}, {arg2}")?,
-            Self::Args(args) => {
-                for (index, arg) in args.iter().enumerate() {
-                    if index == 0 {
-                        write!(f, "{arg}")?;
-                    } else {
-                        write!(f, ", {arg}")?;
-                    }
-                }
-            }
-            Self::Kwargs(kwargs) => {
-                for (index, kwarg) in kwargs.iter().enumerate() {
-                    if index == 0 {
-                        write!(f, "{}={}", kwarg.key.name, kwarg.value)?;
-                    } else {
-                        write!(f, ", {}={}", kwarg.key.name, kwarg.value)?;
-                    }
-                }
-            }
-            Self::ArgsKargs { args, kwargs } => {
-                for (index, arg) in args.iter().enumerate() {
-                    if index == 0 {
-                        write!(f, "{arg}")?;
-                    } else {
-                        write!(f, ", {arg}")?;
-                    }
-                }
-                for kwarg in kwargs {
-                    write!(f, ", {}={}", kwarg.key.name, kwarg.value)?;
-                }
-            }
-        }
-        f.write_char(')')
     }
 }

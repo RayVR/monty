@@ -1,13 +1,64 @@
 use crate::exceptions::{ExcType, SimpleException};
 use crate::expressions::{Identifier, NameScope};
 use crate::heap::{Heap, HeapId};
+use crate::intern::Interns;
 use crate::resource::ResourceTracker;
 use crate::run::RunResult;
 use crate::value::Value;
 
+/// Unique identifier for values stored inside the namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NamespaceId(u32);
+
+impl NamespaceId {
+    pub fn new(index: usize) -> Self {
+        NamespaceId(index.try_into().expect("Invalid namespace id"))
+    }
+
+    /// Returns the raw index value.
+    #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// Index for the global (module-level) namespace in Namespaces.
 /// At module level, local_idx == GLOBAL_NS_IDX (same namespace).
-pub const GLOBAL_NS_IDX: usize = 0;
+pub const GLOBAL_NS_IDX: NamespaceId = NamespaceId(0);
+
+#[derive(Debug)]
+pub struct Namespace(Vec<Value>);
+
+impl Namespace {
+    pub fn get(&self, index: NamespaceId) -> &Value {
+        &self.0[index.index()]
+    }
+
+    pub fn get_opt(&self, index: NamespaceId) -> Option<&Value> {
+        self.0.get(index.index())
+    }
+
+    pub fn get_mut(&mut self, index: NamespaceId) -> &mut Value {
+        &mut self.0[index.index()]
+    }
+
+    pub fn set(&mut self, index: NamespaceId, value: Value) {
+        self.0[index.index()] = value;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Value> {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for Namespace {
+    type Item = Value;
+    type IntoIter = std::vec::IntoIter<Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
 
 /// Storage for all namespaces during execution.
 ///
@@ -25,17 +76,17 @@ pub const GLOBAL_NS_IDX: usize = 0;
 /// Variables captured by closures are stored in cells on the heap, not in namespaces.
 /// The `get_var_value` method handles both namespace-based and cell-based variable access.
 #[derive(Debug)]
-pub struct Namespaces<'c, 'e> {
-    namespaces: Vec<Vec<Value<'c, 'e>>>,
+pub struct Namespaces {
+    namespaces: Vec<Namespace>,
 }
 
-impl<'c, 'e> Namespaces<'c, 'e> {
+impl Namespaces {
     /// Creates namespaces with the global namespace initialized.
     ///
     /// The global namespace is always at index 0.
-    pub fn new(namespace: Vec<Value<'c, 'e>>) -> Self {
+    pub fn new(namespace: Vec<Value>) -> Self {
         Self {
-            namespaces: vec![namespace],
+            namespaces: vec![Namespace(namespace)],
         }
     }
 
@@ -46,25 +97,25 @@ impl<'c, 'e> Namespaces<'c, 'e> {
     ///
     /// # Panics
     /// Panics if `idx` is out of bounds.
-    pub fn get(&self, idx: usize) -> &[Value<'c, 'e>] {
-        self.namespaces[idx].as_slice()
+    pub fn get(&self, idx: NamespaceId) -> &Namespace {
+        &self.namespaces[idx.index()]
     }
 
     /// Gets a mutable slice reference to a namespace by index.
     ///
     /// # Panics
     /// Panics if `idx` is out of bounds.
-    pub fn get_mut(&mut self, idx: usize) -> &mut [Value<'c, 'e>] {
-        self.namespaces[idx].as_mut_slice()
+    pub fn get_mut(&mut self, idx: NamespaceId) -> &mut Namespace {
+        &mut self.namespaces[idx.index()]
     }
 
     /// Creates a new namespace for a function call, returns its index.
     ///
     /// The new namespace is initialized with `Object::Undefined` values.
     /// Call `pop_with_heap()` when the function returns to clean up.
-    pub fn push(&mut self, namespace: Vec<Value<'c, 'e>>) -> usize {
-        let idx = self.namespaces.len();
-        self.namespaces.push(namespace);
+    pub fn push(&mut self, namespace: Vec<Value>) -> NamespaceId {
+        let idx = NamespaceId(self.namespaces.len().try_into().expect("NamespaceId overflow"));
+        self.namespaces.push(Namespace(namespace));
         idx
     }
 
@@ -76,10 +127,10 @@ impl<'c, 'e> Namespaces<'c, 'e> {
     ///
     /// # Panics
     /// Panics if attempting to pop the global namespace (index 0).
-    pub fn pop_with_heap<T: ResourceTracker>(&mut self, heap: &mut Heap<'c, 'e, T>) {
+    pub fn pop_with_heap<T: ResourceTracker>(&mut self, heap: &mut Heap<T>) {
         debug_assert!(self.namespaces.len() > 1, "cannot pop global namespace");
         if let Some(namespace) = self.namespaces.pop() {
-            for value in namespace {
+            for value in namespace.0 {
                 value.drop_with_heap(heap);
             }
         }
@@ -92,23 +143,29 @@ impl<'c, 'e> Namespaces<'c, 'e> {
     ///
     /// Only needed when `dec-ref-check` is enabled, since the Drop impl panics on unfreed Refs.
     #[cfg(feature = "dec-ref-check")]
-    pub fn drop_global_with_heap<T: ResourceTracker>(&mut self, heap: &mut Heap<'c, 'e, T>) {
+    pub fn drop_global_with_heap<T: ResourceTracker>(&mut self, heap: &mut Heap<T>) {
         let global = self.get_mut(GLOBAL_NS_IDX);
-        for value in global.iter_mut() {
+        for value in &mut global.0 {
             let v = std::mem::replace(value, Value::Undefined);
             v.drop_with_heap(heap);
         }
     }
 
-    /// Looks up a variable by name in the appropriate namespace based on the scope index.
+    /// Looks up a variable by name in the appropriate namespace based on the scope index for mutation.
     ///
     /// # Arguments
     /// * `local_idx` - Index of the local namespace in namespaces
     /// * `ident` - The identifier to look up (contains heap_id and scope)
+    /// * `interns` - String storage for looking up variable names in error messages
     ///
     /// # Returns
     /// A mutable reference to the Value at the identifier's location, or NameError if undefined.
-    pub fn get_var_mut(&mut self, local_idx: usize, ident: &Identifier<'c>) -> RunResult<'c, &mut Value<'c, 'e>> {
+    pub fn get_var_mut(
+        &mut self,
+        local_idx: NamespaceId,
+        ident: &Identifier,
+        interns: &Interns,
+    ) -> RunResult<&mut Value> {
         let ns_idx = match ident.scope {
             NameScope::Local => local_idx,
             NameScope::Global => GLOBAL_NS_IDX,
@@ -119,14 +176,48 @@ impl<'c, 'e> Namespaces<'c, 'e> {
         };
         let namespace = self.get_mut(ns_idx);
 
-        if let Some(value) = namespace.get_mut(ident.heap_id()) {
+        if let Some(value) = namespace.0.get_mut(ident.namespace_id().index()) {
             if !matches!(value, Value::Undefined) {
                 return Ok(value);
             }
         }
-        Err(SimpleException::new(ExcType::NameError, Some(ident.name.into()))
-            .with_position(ident.position)
-            .into())
+        Err(
+            SimpleException::new(ExcType::NameError, Some(interns.get_str(ident.name_id).to_string()))
+                .with_position(ident.position)
+                .into(),
+        )
+    }
+
+    /// Looks up a variable by name in the appropriate namespace based on the scope index.
+    ///
+    /// # Arguments
+    /// * `local_idx` - Index of the local namespace in namespaces
+    /// * `ident` - The identifier to look up (contains heap_id and scope)
+    /// * `interns` - String storage for looking up variable names in error messages
+    ///
+    /// # Returns
+    /// An immutable reference to the Value at the identifier's location, or NameError if undefined.
+    pub fn get_var(&self, local_idx: NamespaceId, ident: &Identifier, interns: &Interns) -> RunResult<&Value> {
+        let ns_idx = match ident.scope {
+            NameScope::Local => local_idx,
+            NameScope::Global => GLOBAL_NS_IDX,
+            NameScope::Cell => {
+                // Cell access should use get_var_value which handles cell dereferencing
+                panic!("Cell access should use get_var_value, not get_var_mut");
+            }
+        };
+        let namespace = self.get(ns_idx);
+
+        if let Some(value) = namespace.0.get(ident.namespace_id().index()) {
+            if !matches!(value, Value::Undefined) {
+                return Ok(value);
+            }
+        }
+        Err(
+            SimpleException::new(ExcType::NameError, Some(interns.get_str(ident.name_id).to_string()))
+                .with_position(ident.position)
+                .into(),
+        )
     }
 
     /// Gets a variable's value, handling Local, Global, and Cell scopes.
@@ -141,15 +232,17 @@ impl<'c, 'e> Namespaces<'c, 'e> {
     /// * `local_idx` - Index of the local namespace in namespaces
     /// * `heap` - The heap for cell access and cloning ref-counted values
     /// * `ident` - The identifier to look up (contains heap_id and scope)
+    /// * `interns` - String storage for looking up variable names in error messages
     ///
     /// # Returns
     /// A cloned copy of the value (with refcount incremented for Ref values), or NameError if undefined.
     pub fn get_var_value<T: ResourceTracker>(
-        &mut self,
-        local_idx: usize,
-        heap: &mut Heap<'c, 'e, T>,
-        ident: &Identifier<'c>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+        &self,
+        local_idx: NamespaceId,
+        heap: &mut Heap<T>,
+        ident: &Identifier,
+        interns: &Interns,
+    ) -> RunResult<Value> {
         // Determine which namespace to use
         let ns_idx = match ident.scope {
             NameScope::Global => GLOBAL_NS_IDX,
@@ -159,12 +252,13 @@ impl<'c, 'e> Namespaces<'c, 'e> {
         match ident.scope {
             NameScope::Cell => {
                 // Cell access - namespace slot contains Value::Ref(cell_id)
-                let namespace = &self.namespaces[ns_idx];
-                if let Value::Ref(cell_id) = namespace[ident.heap_id()] {
-                    let value = heap.get_cell_value(cell_id);
+                let namespace = &self.namespaces[ns_idx.index()];
+                if let Value::Ref(cell_id) = namespace.get(ident.namespace_id()) {
+                    let value = heap.get_cell_value(*cell_id);
                     // Cell may be undefined if accessed before assignment in enclosing scope
                     if matches!(value, Value::Undefined) {
-                        Err(ExcType::name_error_free_variable(ident.name).into())
+                        let name = interns.get_str(ident.name_id);
+                        Err(ExcType::name_error_free_variable(name).into())
                     } else {
                         Ok(value)
                     }
@@ -174,7 +268,7 @@ impl<'c, 'e> Namespaces<'c, 'e> {
             }
             _ => {
                 // Local or Global scope - direct namespace access
-                self.get_var_mut(ns_idx, ident)
+                self.get_var(ns_idx, ident, interns)
                     .map(|object| object.clone_with_heap(heap))
             }
         }
@@ -186,8 +280,8 @@ impl<'c, 'e> Namespaces<'c, 'e> {
     ///
     /// Only available when the `ref-counting` feature is enabled.
     #[cfg(feature = "ref-counting")]
-    pub fn into_global(mut self) -> Vec<Value<'c, 'e>> {
-        self.namespaces.swap_remove(GLOBAL_NS_IDX)
+    pub fn into_global(mut self) -> Namespace {
+        self.namespaces.swap_remove(GLOBAL_NS_IDX.index())
     }
 
     /// Returns an iterator over all HeapIds referenced by values in all namespaces.

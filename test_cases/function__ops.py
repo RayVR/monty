@@ -136,3 +136,104 @@ def nested_with_args(x):
 
 
 assert nested_with_args(5) == 11, 'nested with args'
+
+
+# === Function equality ===
+def eq_test():
+    return 1
+
+
+def eq_test2():
+    return 1
+
+
+# Same function is equal to itself
+assert eq_test == eq_test, 'function equals itself'
+assert not (eq_test != eq_test), 'function not-not-equals itself'
+
+# Different functions are not equal (even with same body)
+assert not (eq_test == eq_test2), 'different functions not equal'
+assert eq_test != eq_test2, 'different functions are not equal'
+
+# Function assigned to variable is still equal
+f_alias = eq_test
+assert f_alias == eq_test, 'function alias equals original'
+assert eq_test == f_alias, 'original equals function alias'
+
+
+# === Builtin equality ===
+# Same builtin is equal to itself
+assert len == len, 'builtin equals itself'
+assert print == print, 'print equals itself'
+assert not (len != len), 'builtin not-not-equals itself'
+
+# Builtin identity (is)
+assert print is print, 'print is print'
+assert len is len, 'len is len'
+assert not (len is print), 'len is not print'
+
+# Different builtins are not equal
+assert not (len == print), 'different builtins not equal'
+assert len != print, 'different builtins are not equal'
+
+# Builtin assigned to variable is still equal
+len_alias = len
+assert len_alias == len, 'builtin alias equals original'
+assert len_alias is len, 'builtin alias is original'
+
+
+# === Exception type equality ===
+# Note: Using == instead of 'is' to explicitly test the __eq__ implementation
+assert ValueError == ValueError, 'exc type equals itself'
+assert TypeError == TypeError, 'exc type equals itself 2'
+assert not (ValueError != ValueError), 'exc type not-not-equals itself'
+
+assert not (ValueError == TypeError), 'different exc types not equal'
+assert ValueError != TypeError, 'different exc types are not equal'
+
+exc_alias = ValueError
+assert exc_alias == ValueError, 'exc type alias equals original'
+
+
+# === Closure equality ===
+def make_adder(n):
+    def adder(x):
+        return x + n
+
+    return adder
+
+
+add1 = make_adder(1)
+add2 = make_adder(2)
+add1_again = make_adder(1)
+
+# Same closure instance equals itself
+assert add1 == add1, 'closure equals itself'
+assert not (add1 != add1), 'closure not-not-equals itself'
+
+# Different closure instances are not equal (even with same captured value)
+assert not (add1 == add1_again), 'different closure instances not equal'
+assert add1 != add1_again, 'different closure instances are not equal'
+
+# Different closure instances with different captured values
+assert not (add1 == add2), 'closures with diff captured values not equal'
+assert add1 != add2, 'closures with diff captured values are not equal'
+
+
+# === Cross-type inequality ===
+def cross_test():
+    return 1
+
+
+assert not (cross_test == len), 'function not equal to builtin'
+assert not (len == cross_test), 'builtin not equal to function'
+assert not (cross_test == ValueError), 'function not equal to exc type'
+assert not (ValueError == cross_test), 'exc type not equal to function'
+assert not (len == ValueError), 'builtin not equal to exc type'
+assert not (ValueError == len), 'exc type not equal to builtin'
+
+# Callables not equal to other types
+assert not (len == 1), 'builtin not equal to int'
+assert not (len == 'len'), 'builtin not equal to string'
+assert not (cross_test == None), 'function not equal to None'
+assert not (ValueError == None), 'exc type not equal to None'

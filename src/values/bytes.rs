@@ -7,6 +7,7 @@ use std::fmt::Write;
 use ahash::AHashSet;
 
 use crate::heap::{Heap, HeapId};
+use crate::intern::Interns;
 use crate::resource::ResourceTracker;
 use crate::values::PyTrait;
 
@@ -61,8 +62,8 @@ impl std::ops::Deref for Bytes {
     }
 }
 
-impl<'c, 'e> PyTrait<'c, 'e> for Bytes {
-    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<'c, 'e, T>>) -> &'static str {
+impl PyTrait for Bytes {
+    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<T>>) -> &'static str {
         "bytes"
     }
 
@@ -70,11 +71,11 @@ impl<'c, 'e> PyTrait<'c, 'e> for Bytes {
         std::mem::size_of::<Self>() + self.0.len()
     }
 
-    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> Option<usize> {
+    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> Option<usize> {
         Some(self.0.len())
     }
 
-    fn py_eq<T: ResourceTracker>(&self, other: &Self, _heap: &mut Heap<'c, 'e, T>) -> bool {
+    fn py_eq<T: ResourceTracker>(&self, other: &Self, _heap: &mut Heap<T>, _interns: &Interns) -> bool {
         self.0 == other.0
     }
 
@@ -83,15 +84,16 @@ impl<'c, 'e> PyTrait<'c, 'e> for Bytes {
         // No-op: bytes don't hold Value references
     }
 
-    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> bool {
+    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> bool {
         !self.0.is_empty()
     }
 
     fn py_repr_fmt<W: Write, T: ResourceTracker>(
         &self,
         f: &mut W,
-        _heap: &Heap<'c, 'e, T>,
-        _heap_ids: &mut AHashSet<usize>,
+        _heap: &Heap<T>,
+        _heap_ids: &mut AHashSet<HeapId>,
+        _interns: &Interns,
     ) -> std::fmt::Result {
         bytes_repr_fmt(&self.0, f)
     }

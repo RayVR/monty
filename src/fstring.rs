@@ -4,14 +4,14 @@
 //! F-strings can contain literal text and interpolated expressions with optional
 //! conversion flags (`!s`, `!r`, `!a`) and format specifications.
 
-use std::borrow::Cow;
-use std::fmt::{self, Write};
 use std::str::FromStr;
 
 use crate::evaluate::EvaluateExpr;
 use crate::exceptions::{exc_fmt, ExcType};
 use crate::expressions::ExprLoc;
+
 use crate::heap::{Heap, HeapData};
+use crate::intern::Interns;
 use crate::resource::ResourceTracker;
 use crate::run::RunResult;
 use crate::value::Value;
@@ -40,17 +40,6 @@ pub enum ConversionFlag {
     Ascii,
 }
 
-impl fmt::Display for ConversionFlag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => Ok(()),
-            Self::Str => f.write_str("!s"),
-            Self::Repr => f.write_str("!r"),
-            Self::Ascii => f.write_str("!a"),
-        }
-    }
-}
-
 /// A single part of an f-string.
 ///
 /// F-strings are composed of literal text segments and interpolated expressions.
@@ -59,20 +48,17 @@ impl fmt::Display for ConversionFlag {
 /// - `Interpolation { expr: name, ... }`
 /// - `Literal("!")`
 #[derive(Debug, Clone)]
-pub enum FStringPart<'c> {
+pub enum FStringPart {
     /// Literal text segment (e.g., "Hello " in `f"Hello {name}"`)
-    ///
-    /// Uses `Cow` to avoid allocation when the source matches the processed value
-    /// (i.e., no escape sequences were processed).
-    Literal(Cow<'c, str>),
+    Literal(String),
     /// Interpolated expression with optional conversion and format spec
     Interpolation {
         /// The expression to evaluate
-        expr: Box<ExprLoc<'c>>,
+        expr: Box<ExprLoc>,
         /// Conversion flag: `None`, `!s` (str), `!r` (repr), `!a` (ascii)
         conversion: ConversionFlag,
         /// Optional format specification (can contain nested interpolations)
-        format_spec: Option<FormatSpec<'c>>,
+        format_spec: Option<FormatSpec>,
     },
 }
 
@@ -83,7 +69,7 @@ pub enum FStringPart<'c> {
 /// - `f"{value:>10}"` has `FormatSpec::Static(ParsedFormatSpec { ... })`
 /// - `f"{value:{width}}"` has `FormatSpec::Dynamic` with the `width` variable
 #[derive(Debug, Clone)]
-pub enum FormatSpec<'c> {
+pub enum FormatSpec {
     /// Pre-parsed static format spec (e.g., ">10s", ".2f")
     ///
     /// Parsing happens at parse time to avoid runtime string parsing overhead.
@@ -92,26 +78,7 @@ pub enum FormatSpec<'c> {
     /// Dynamic format spec with nested f-string parts
     ///
     /// These must be evaluated at runtime, then parsed into a `ParsedFormatSpec`.
-    Dynamic(Vec<FStringPart<'c>>),
-}
-
-impl fmt::Display for FormatSpec<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Static(spec) => write!(f, "{spec}"),
-            Self::Dynamic(parts) => {
-                for part in parts {
-                    match part {
-                        FStringPart::Literal(s) => f.write_str(s)?,
-                        FStringPart::Interpolation { expr, conversion, .. } => {
-                            write!(f, "{{{expr}{conversion}}}")?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
+    Dynamic(Vec<FStringPart>),
 }
 
 /// Parsed format specification following Python's format mini-language.
@@ -248,33 +215,6 @@ impl FromStr for ParsedFormatSpec {
     }
 }
 
-impl fmt::Display for ParsedFormatSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.fill != ' ' {
-            f.write_char(self.fill)?;
-        }
-        if let Some(align) = self.align {
-            write!(f, "{align}")?;
-        }
-        if let Some(sign) = self.sign {
-            write!(f, "{sign}")?;
-        }
-        if self.zero_pad {
-            f.write_char('0')?;
-        }
-        if self.width > 0 {
-            write!(f, "{}", self.width)?;
-        }
-        if let Some(prec) = self.precision {
-            write!(f, ".{prec}")?;
-        }
-        if let Some(tc) = self.type_char {
-            f.write_char(tc)?;
-        }
-        Ok(())
-    }
-}
-
 // ============================================================================
 // F-string evaluation
 // ============================================================================
@@ -289,7 +229,7 @@ enum ValueType {
 }
 
 impl ValueType {
-    fn from_value<'c, 'e, T: ResourceTracker>(value: &Value<'c, 'e>, heap: &Heap<'c, 'e, T>) -> Self {
+    fn from_value<T: ResourceTracker>(value: &Value, heap: &Heap<T>) -> Self {
         match value {
             Value::Int(_) => ValueType::Int,
             Value::Float(_) => ValueType::Float,
@@ -330,25 +270,25 @@ impl ValueType {
 /// # Returns
 /// `Ok(())` on success, or an error if formatting fails.
 /// The caller is responsible for dropping `value` after this function returns.
-pub(crate) fn fstring_interpolation<'c, 'e, T: ResourceTracker>(
-    evaluator: &mut EvaluateExpr<'c, 'e, '_, T>,
+pub(crate) fn fstring_interpolation<T: ResourceTracker>(
+    evaluator: &mut EvaluateExpr<'_, '_, T>,
     result: &mut String,
-    value: &Value<'c, 'e>,
+    value: &Value,
     conversion: ConversionFlag,
-    format_spec: Option<&'e FormatSpec<'c>>,
-) -> RunResult<'c, ()> {
+    format_spec: Option<&FormatSpec>,
+) -> RunResult<()> {
     // 1. Get the value type for format spec validation
     // When a conversion flag is used (!s, !r, !a), the result is always a string,
     // so we should validate against String type, not the original value type.
     let value_type = if conversion == ConversionFlag::None {
-        ValueType::from_value(value, evaluator.heap())
+        ValueType::from_value(value, evaluator.heap)
     } else {
         ValueType::String
     };
 
     // 2. Apply conversion flag (str, repr, ascii)
     // TODO this is really ugly we go value -> str -> parse the string to see if it's numeric!
-    let converted = apply_conversion(value, conversion, evaluator.heap());
+    let converted = apply_conversion(value, conversion, evaluator.heap, evaluator.interns);
 
     // 3. Apply format specification if present
     if let Some(spec) = format_spec {
@@ -380,17 +320,18 @@ pub(crate) fn fstring_interpolation<'c, 'e, T: ResourceTracker>(
 /// - Str (`!s`): Explicitly uses `py_str()`
 /// - Repr (`!r`): Uses `py_repr()` for debugging representation
 /// - Ascii (`!a`): Uses `py_repr()` and escapes non-ASCII characters
-fn apply_conversion<'c, 'e, T: ResourceTracker>(
-    value: &Value<'c, 'e>,
+fn apply_conversion<T: ResourceTracker>(
+    value: &Value,
     conversion: ConversionFlag,
-    heap: &Heap<'c, 'e, T>,
+    heap: &Heap<T>,
+    interns: &Interns,
 ) -> String {
     match conversion {
-        ConversionFlag::None | ConversionFlag::Str => value.py_str(heap).into_owned(),
-        ConversionFlag::Repr => value.py_repr(heap).into_owned(),
+        ConversionFlag::None | ConversionFlag::Str => value.py_str(heap, interns).into_owned(),
+        ConversionFlag::Repr => value.py_repr(heap, interns).into_owned(),
         ConversionFlag::Ascii => {
             // ASCII conversion: like repr but escapes non-ASCII characters
-            let repr = value.py_repr(heap);
+            let repr = value.py_repr(heap, interns);
             escape_non_ascii(&repr)
         }
     }
@@ -400,19 +341,19 @@ fn apply_conversion<'c, 'e, T: ResourceTracker>(
 ///
 /// Evaluates each part and concatenates the results into a format spec string,
 /// which is then parsed into a `ParsedFormatSpec` at runtime.
-fn evaluate_dynamic_format_spec<'c, 'e, T: ResourceTracker>(
-    evaluator: &mut EvaluateExpr<'c, 'e, '_, T>,
-    parts: &'e [FStringPart<'c>],
-) -> RunResult<'c, String> {
+fn evaluate_dynamic_format_spec<T: ResourceTracker>(
+    evaluator: &mut EvaluateExpr<'_, '_, T>,
+    parts: &[FStringPart],
+) -> RunResult<String> {
     let mut result = String::new();
     for part in parts {
         match part {
             FStringPart::Literal(s) => result.push_str(s),
             FStringPart::Interpolation { expr, conversion, .. } => {
                 let value = evaluator.evaluate_use(expr)?;
-                let converted = apply_conversion(&value, *conversion, evaluator.heap());
+                let converted = apply_conversion(&value, *conversion, evaluator.heap, evaluator.interns);
                 result.push_str(&converted);
-                value.drop_with_heap(evaluator.heap());
+                value.drop_with_heap(evaluator.heap);
             }
         }
     }
@@ -423,7 +364,7 @@ fn evaluate_dynamic_format_spec<'c, 'e, T: ResourceTracker>(
 ///
 /// Matches Python's error message format:
 /// `ValueError: Invalid format specifier 'xyz' for object of type 'int'`
-fn invalid_format_spec_error(spec: &str, value_type: ValueType) -> crate::exceptions::SimpleException<'static> {
+fn invalid_format_spec_error(spec: &str, value_type: ValueType) -> crate::exceptions::SimpleException {
     exc_fmt!(
         ExcType::ValueError;
         "Invalid format specifier '{}' for object of type '{}'",
@@ -436,7 +377,7 @@ fn invalid_format_spec_error(spec: &str, value_type: ValueType) -> crate::except
 ///
 /// Returns a `ValueError` if the format spec is incompatible with the value type,
 /// matching CPython's error messages exactly.
-fn validate_format_spec(spec: &ParsedFormatSpec, value_type: ValueType) -> RunResult<'static, ()> {
+fn validate_format_spec(spec: &ParsedFormatSpec, value_type: ValueType) -> RunResult<()> {
     // Check '=' alignment - only valid for numeric types
     if spec.align == Some('=') && !matches!(value_type, ValueType::Int | ValueType::Float) {
         return Err(exc_fmt!(ExcType::ValueError; "'=' alignment not allowed in string format specifier").into());
@@ -499,12 +440,7 @@ fn validate_format_spec(spec: &ParsedFormatSpec, value_type: ValueType) -> RunRe
 ///
 /// Returns a `RunError` if the format spec is invalid for the given value type,
 /// matching CPython's error messages.
-fn apply_format_spec(
-    write: &mut String,
-    value: &str,
-    spec: &ParsedFormatSpec,
-    value_type: ValueType,
-) -> RunResult<'static, ()> {
+fn apply_format_spec(write: &mut String, value: &str, spec: &ParsedFormatSpec, value_type: ValueType) -> RunResult<()> {
     // Validate format spec against value type
     validate_format_spec(spec, value_type)?;
 

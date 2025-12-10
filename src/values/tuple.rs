@@ -1,4 +1,4 @@
-/// Python tuple type, wrapping a `Vec<Value<'c, 'e>>`.
+/// Python tuple type, wrapping a `Vec<Value>`.
 ///
 /// This type provides Python tuple semantics. Tuples are immutable sequences
 /// that can contain any Python object. Like lists, tuples properly handle
@@ -8,7 +8,9 @@ use std::fmt::Write;
 use ahash::AHashSet;
 
 use crate::exceptions::ExcType;
+
 use crate::heap::{Heap, HeapId};
+use crate::intern::Interns;
 use crate::resource::ResourceTracker;
 use crate::run::RunResult;
 use crate::value::Value;
@@ -17,7 +19,7 @@ use crate::values::PyTrait;
 
 /// Python tuple value stored on the heap.
 ///
-/// Wraps a `Vec<Value<'c, 'e>>` and provides Python-compatible tuple operations.
+/// Wraps a `Vec<Value>` and provides Python-compatible tuple operations.
 /// Unlike lists, tuples are conceptually immutable (though this is not
 /// enforced at the type level for internal operations).
 ///
@@ -25,21 +27,21 @@ use crate::values::PyTrait;
 /// When a tuple is freed, all contained heap references have their refcounts
 /// decremented via `push_stack_ids`.
 #[derive(Debug, Default)]
-pub struct Tuple<'c, 'e>(Vec<Value<'c, 'e>>);
+pub struct Tuple(Vec<Value>);
 
-impl<'c, 'e> Tuple<'c, 'e> {
+impl Tuple {
     /// Creates a new tuple from a vector of values.
     ///
     /// Note: This does NOT increment reference counts - the caller must
     /// ensure refcounts are properly managed.
     #[must_use]
-    pub fn from_vec(vec: Vec<Value<'c, 'e>>) -> Self {
+    pub fn from_vec(vec: Vec<Value>) -> Self {
         Self(vec)
     }
 
     /// Returns a reference to the underlying vector.
     #[must_use]
-    pub fn as_vec(&self) -> &Vec<Value<'c, 'e>> {
+    pub fn as_vec(&self) -> &Vec<Value> {
         &self.0
     }
 
@@ -49,32 +51,32 @@ impl<'c, 'e> Tuple<'c, 'e> {
     /// incremented. This should be used instead of `.clone()` which would
     /// bypass reference counting.
     #[must_use]
-    pub fn clone_with_heap<T: ResourceTracker>(&self, heap: &mut Heap<'c, 'e, T>) -> Self {
-        let cloned: Vec<Value<'c, 'e>> = self.0.iter().map(|obj| obj.clone_with_heap(heap)).collect();
+    pub fn clone_with_heap<T: ResourceTracker>(&self, heap: &mut Heap<T>) -> Self {
+        let cloned: Vec<Value> = self.0.iter().map(|obj| obj.clone_with_heap(heap)).collect();
         Self(cloned)
     }
 }
 
-impl<'c, 'e> From<Vec<Value<'c, 'e>>> for Tuple<'c, 'e> {
-    fn from(vec: Vec<Value<'c, 'e>>) -> Self {
+impl From<Vec<Value>> for Tuple {
+    fn from(vec: Vec<Value>) -> Self {
         Self(vec)
     }
 }
 
-impl<'c, 'e> std::iter::FromIterator<Value<'c, 'e>> for Tuple<'c, 'e> {
-    fn from_iter<I: IntoIterator<Item = Value<'c, 'e>>>(iter: I) -> Self {
+impl FromIterator<Value> for Tuple {
+    fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
 }
 
-impl<'c, 'e> From<Tuple<'c, 'e>> for Vec<Value<'c, 'e>> {
-    fn from(tuple: Tuple<'c, 'e>) -> Self {
+impl From<Tuple> for Vec<Value> {
+    fn from(tuple: Tuple) -> Self {
         tuple.0
     }
 }
 
-impl<'c, 'e> PyTrait<'c, 'e> for Tuple<'c, 'e> {
-    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<'c, 'e, T>>) -> &'static str {
+impl PyTrait for Tuple {
+    fn py_type<T: ResourceTracker>(&self, _heap: Option<&Heap<T>>) -> &'static str {
         "tuple"
     }
 
@@ -82,15 +84,11 @@ impl<'c, 'e> PyTrait<'c, 'e> for Tuple<'c, 'e> {
         std::mem::size_of::<Self>() + self.0.len() * std::mem::size_of::<Value>()
     }
 
-    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> Option<usize> {
+    fn py_len<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> Option<usize> {
         Some(self.0.len())
     }
 
-    fn py_getitem<T: ResourceTracker>(
-        &self,
-        key: &Value<'c, 'e>,
-        heap: &mut Heap<'c, 'e, T>,
-    ) -> RunResult<'static, Value<'c, 'e>> {
+    fn py_getitem<T: ResourceTracker>(&self, key: &Value, heap: &mut Heap<T>, _interns: &Interns) -> RunResult<Value> {
         // Extract integer index from key, returning TypeError if not an int
         let index = match key {
             Value::Int(i) => *i,
@@ -110,12 +108,12 @@ impl<'c, 'e> PyTrait<'c, 'e> for Tuple<'c, 'e> {
         Ok(self.0[normalized_index as usize].clone_with_heap(heap))
     }
 
-    fn py_eq<T: ResourceTracker>(&self, other: &Self, heap: &mut Heap<'c, 'e, T>) -> bool {
+    fn py_eq<T: ResourceTracker>(&self, other: &Self, heap: &mut Heap<T>, interns: &Interns) -> bool {
         if self.0.len() != other.0.len() {
             return false;
         }
         for (i1, i2) in self.0.iter().zip(&other.0) {
-            if !i1.py_eq(i2, heap) {
+            if !i1.py_eq(i2, heap, interns) {
                 return false;
             }
         }
@@ -138,16 +136,17 @@ impl<'c, 'e> PyTrait<'c, 'e> for Tuple<'c, 'e> {
 
     // py_call_attr uses default implementation which returns AttributeError
 
-    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<'c, 'e, T>) -> bool {
+    fn py_bool<T: ResourceTracker>(&self, _heap: &Heap<T>, _interns: &Interns) -> bool {
         !self.0.is_empty()
     }
 
     fn py_repr_fmt<W: Write, T: ResourceTracker>(
         &self,
         f: &mut W,
-        heap: &Heap<'c, 'e, T>,
-        heap_ids: &mut AHashSet<usize>,
+        heap: &Heap<T>,
+        heap_ids: &mut AHashSet<HeapId>,
+        interns: &Interns,
     ) -> std::fmt::Result {
-        repr_sequence_fmt('(', ')', &self.0, f, heap, heap_ids)
+        repr_sequence_fmt('(', ')', &self.0, f, heap, heap_ids, interns)
     }
 }

@@ -1,15 +1,11 @@
-use core::fmt;
-use std::fmt::Write;
-
-use ahash::AHashSet;
-
 use crate::{
     args::ArgValues,
     builtins::Builtins,
     exceptions::{exc_fmt, ExcType},
     expressions::Identifier,
-    heap::Heap,
-    namespace::Namespaces,
+    heap::{Heap, HeapData},
+    intern::Interns,
+    namespace::{NamespaceId, Namespaces},
     resource::ResourceTracker,
     run::RunResult,
     value::Value,
@@ -19,35 +15,19 @@ use crate::{
 /// Target of a function call expression.
 ///
 /// Represents a callable that can be either:
-/// - A builtin function resolved at parse time (`print`, `len`, etc.)
-/// - An exception type constructor resolved at parse time (`ValueError`, etc.)
+/// - A builtin function or exception resolved at parse time (`print`, `len`, `ValueError`, etc.)
 /// - A name that will be looked up in the namespace at runtime (for callable variables)
 ///
 /// Separate from Value to allow deriving Clone without Value's Clone restrictions.
-#[derive(Debug, Clone)]
-pub(crate) enum Callable<'c> {
+#[derive(Debug, Clone, Copy)]
+pub enum Callable {
     /// A builtin function like `print`, `len`, `str`, etc.
     Builtin(Builtins),
-    /// An exception type constructor like `ValueError`, `TypeError`, etc.
-    ExcType(ExcType),
     /// A name to be looked up in the namespace at runtime (e.g., `x` in `x = len; x('abc')`).
-    Name(Identifier<'c>),
+    Name(Identifier),
 }
 
-impl fmt::Display for Callable<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Builtin(b) => write!(f, "{b}"),
-            Self::ExcType(e) => {
-                let type_str: &'static str = (*e).into();
-                f.write_str(type_str)
-            }
-            Self::Name(ident) => f.write_str(ident.name),
-        }
-    }
-}
-
-impl<'c> Callable<'c> {
+impl Callable {
     /// Calls this callable with the given arguments.
     ///
     /// # Arguments
@@ -55,65 +35,59 @@ impl<'c> Callable<'c> {
     /// * `local_idx` - Index of the local namespace in namespaces
     /// * `heap` - The heap for allocating objects
     /// * `args` - The arguments to pass to the callable
-    pub fn call<'e, T: ResourceTracker>(
+    /// * `interns` - String storage for looking up interned names in error messages
+    pub fn call<T: ResourceTracker>(
         &self,
-        namespaces: &mut Namespaces<'c, 'e>,
-        local_idx: usize,
-        heap: &mut Heap<'c, 'e, T>,
-        args: ArgValues<'c, 'e>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+        namespaces: &mut Namespaces,
+        local_idx: NamespaceId,
+        heap: &mut Heap<T>,
+        args: ArgValues,
+        interns: &Interns,
+    ) -> RunResult<Value> {
         match self {
-            Callable::Builtin(b) => b.call(heap, args),
-            Callable::ExcType(exc) => exc.call(heap, args),
+            Callable::Builtin(b) => b.call(heap, args, interns),
             Callable::Name(ident) => {
-                // Look up the callable in the namespace and clone it to release the borrow
-                // before making the recursive call that needs namespaces
-                let callable_obj = namespaces.get_var_mut(local_idx, ident)?;
-                match callable_obj {
-                    Value::Callable(callable) => {
-                        let callable = callable.clone();
-                        callable.call(namespaces, local_idx, heap, args)
+                // Look up the callable in the namespace
+                let value = namespaces.get_var(local_idx, ident, interns)?;
+
+                match value {
+                    Value::Builtin(builtin) => return builtin.call(heap, args, interns),
+                    Value::Function(f_id) => return interns.get_function(*f_id).call(namespaces, heap, args, interns),
+                    // Check for heap-allocated closure
+                    Value::Ref(heap_id) => {
+                        let heap_data = heap.get(*heap_id);
+                        if let HeapData::Closure(f_id, cells) = heap_data {
+                            let f = interns.get_function(*f_id);
+                            // Clone the cells to release the borrow on heap_data before calling
+                            // call_with_cells will inc_ref when injecting into the new namespace
+                            let cells = cells.clone();
+                            return f.call_with_cells(namespaces, heap, args, &cells, interns);
+                        }
                     }
-                    Value::Function(f) => f.call(namespaces, heap, args),
-                    Value::Closure(f, cells) => {
-                        // Clone the cells to release the borrow on callable_obj before calling
-                        // call_with_cells will inc_ref when injecting into the new namespace
-                        let cells = cells.clone();
-                        f.call_with_cells(namespaces, heap, args, &cells)
-                    }
-                    _ => {
-                        let type_name = callable_obj.py_type(Some(heap));
-                        let err = exc_fmt!(ExcType::TypeError; "'{type_name}' object is not callable");
-                        Err(err.with_position(ident.position).into())
-                    }
+                    _ => {}
                 }
+                let type_name = value.py_type(Some(heap));
+                let err = exc_fmt!(ExcType::TypeError; "'{type_name}' object is not callable");
+                Err(err.with_position(ident.position).into())
             }
         }
     }
 
-    pub fn to_value(&self) -> Value<'c, '_> {
-        Value::Callable(self.clone())
-    }
-
-    /// Writes the Python repr() string for this callable to a formatter.
-    pub fn py_repr_fmt<'e, W: Write, T: ResourceTracker>(
-        &self,
-        f: &mut W,
-        heap: &Heap<'c, 'e, T>,
-        heap_ids: &mut AHashSet<usize>,
-    ) -> std::fmt::Result {
-        match self {
-            Self::Builtin(b) => write!(f, "<built-in function {}>", b.as_ref()),
-            Self::ExcType(e) => write!(f, "<class '{}'>", <&'static str>::from(*e)),
-            Self::Name(name) => heap.get(name.heap_id()).py_repr_fmt(f, heap, heap_ids),
+    /// Returns true if this Callable is equal to another Callable.
+    ///
+    /// We assume functions with the same name and position in code are equal.
+    pub fn py_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Builtin(b1), Self::Builtin(b2)) => b1 == b2,
+            (Self::Name(n1), Self::Name(n2)) => n1.py_eq(n2),
+            _ => false,
         }
     }
 
     pub fn py_type(&self) -> &'static str {
         match self {
-            Self::Builtin(_) => "builtin_function_or_method",
-            Self::ExcType(_) => "type",
-            Self::Name(_) => "function",
+            Self::Builtin(b) => b.py_type(),
+            Self::Name(_) => "TODO",
         }
     }
 }

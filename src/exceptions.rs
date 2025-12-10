@@ -8,7 +8,9 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::args::ArgValues;
 use crate::expressions::ExprLoc;
+
 use crate::heap::HeapData;
+use crate::intern::{Interns, StringId};
 use crate::operators::{CmpOperator, Operator};
 use crate::parse::CodeRange;
 use crate::resource::{ResourceError, ResourceTracker};
@@ -23,7 +25,7 @@ use crate::Heap;
 /// Uses strum derives for automatic `Display`, `FromStr`, and `Into<&'static str>` implementations.
 /// The string representation matches the variant name exactly (e.g., `ValueError` -> "ValueError").
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, Copy, PartialEq, Hash, Display, EnumString, IntoStaticStr, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, IntoStaticStr, Serialize, Deserialize)]
 pub enum ExcType {
     AssertionError,
     ValueError,
@@ -43,22 +45,23 @@ impl ExcType {
     ///
     /// Handles exception constructors like `ValueError('message')`.
     /// Currently supports zero or one string argument.
-    pub(crate) fn call<'c, 'e, T: ResourceTracker>(
+    ///
+    /// The `interns` parameter provides access to interned string content.
+    pub(crate) fn call<T: ResourceTracker>(
         self,
-        heap: &mut Heap<'c, 'e, T>,
-        args: ArgValues<'c, 'e>,
-    ) -> RunResult<'c, Value<'c, 'e>> {
+        heap: &mut Heap<T>,
+        args: ArgValues,
+        interns: &Interns,
+    ) -> RunResult<Value> {
         match args {
             ArgValues::Zero => Ok(Value::Exc(SimpleException::new(self, None))),
-            ArgValues::One(Value::InternString(s)) => {
-                Ok(Value::Exc(SimpleException::new(self, Some(s.to_owned().into()))))
-            }
+            ArgValues::One(Value::InternString(string_id)) => Ok(Value::Exc(SimpleException::new(
+                self,
+                Some(interns.get_str(string_id).to_owned()),
+            ))),
             ArgValues::One(Value::Ref(heap_id)) => {
                 if let HeapData::Str(s) = heap.get(heap_id) {
-                    Ok(Value::Exc(SimpleException::new(
-                        self,
-                        Some(s.as_str().to_owned().into()),
-                    )))
+                    Ok(Value::Exc(SimpleException::new(self, Some(s.as_str().to_owned()))))
                 } else {
                     internal_err!(InternalRunError::TodoError; "Exceptions can only be called with zero or one string argument")
                 }
@@ -70,12 +73,12 @@ impl ExcType {
     }
 
     #[must_use]
-    pub fn attribute_error(type_str: &str, attr: &Attr) -> RunError<'static> {
+    pub fn attribute_error(type_str: &str, attr: &Attr) -> RunError {
         exc_fmt!(Self::AttributeError; "'{type_str}' object has no attribute '{attr}'").into()
     }
 
     #[must_use]
-    pub fn type_error_not_sub(type_str: &str) -> RunError<'static> {
+    pub fn type_error_not_sub(type_str: &str) -> RunError {
         exc_fmt!(Self::TypeError; "'{type_str}' object is not subscriptable").into()
     }
 
@@ -83,7 +86,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `TypeError: '{type}' object does not support item assignment`
     #[must_use]
-    pub fn type_error_not_sub_assignment(type_str: &str) -> RunError<'static> {
+    pub fn type_error_not_sub_assignment(type_str: &str) -> RunError {
         exc_fmt!(Self::TypeError; "'{type_str}' object does not support item assignment").into()
     }
 
@@ -91,7 +94,7 @@ impl ExcType {
     ///
     /// This matches Python's error message: `TypeError: unhashable type: 'list'`
     #[must_use]
-    pub fn type_error_unhashable(type_str: &str) -> RunError<'static> {
+    pub fn type_error_unhashable(type_str: &str) -> RunError {
         exc_fmt!(Self::TypeError; "unhashable type: '{type_str}'").into()
     }
 
@@ -100,19 +103,19 @@ impl ExcType {
     /// For string keys, uses the raw string value without extra quoting.
     /// For other types, uses repr.
     #[must_use]
-    pub fn key_error<T: ResourceTracker>(key: &Value<'_, '_>, heap: &Heap<'_, '_, T>) -> RunError<'static> {
+    pub fn key_error<T: ResourceTracker>(key: &Value, heap: &Heap<T>, interns: &Interns) -> RunError {
         let key_str = match key {
-            Value::InternString(s) => (*s).to_owned(),
+            Value::InternString(string_id) => interns.get_str(*string_id).to_owned(),
             Value::Ref(id) => {
                 if let HeapData::Str(s) = heap.get(*id) {
                     s.as_str().to_owned()
                 } else {
-                    key.py_repr(heap).into_owned()
+                    key.py_repr(heap, interns).into_owned()
                 }
             }
-            _ => key.py_repr(heap).into_owned(),
+            _ => key.py_repr(heap, interns).into_owned(),
         };
-        SimpleException::new(Self::KeyError, Some(key_str.into())).into()
+        SimpleException::new(Self::KeyError, Some(key_str)).into()
     }
 
     /// Creates a TypeError for when a function receives the wrong number of arguments.
@@ -126,7 +129,7 @@ impl ExcType {
     /// * `expected` - Number of expected arguments
     /// * `actual` - Number of arguments actually provided
     #[must_use]
-    pub fn type_error_arg_count(name: &str, expected: usize, actual: usize) -> RunError<'static> {
+    pub fn type_error_arg_count(name: &str, expected: usize, actual: usize) -> RunError {
         if expected == 1 {
             // CPython: "len() takes exactly one argument (2 given)"
             exc_fmt!(Self::TypeError; "{}() takes exactly one argument ({} given)", name, actual).into()
@@ -144,7 +147,7 @@ impl ExcType {
     /// * `name` - The method name (e.g., "dict.keys")
     /// * `actual` - Number of arguments actually provided
     #[must_use]
-    pub fn type_error_no_args(name: &str, actual: usize) -> RunError<'static> {
+    pub fn type_error_no_args(name: &str, actual: usize) -> RunError {
         // CPython: "dict.keys() takes no arguments (1 given)"
         exc_fmt!(Self::TypeError; "{}() takes no arguments ({} given)", name, actual).into()
     }
@@ -158,7 +161,7 @@ impl ExcType {
     /// * `min` - Minimum number of required arguments
     /// * `actual` - Number of arguments actually provided
     #[must_use]
-    pub fn type_error_at_least(name: &str, min: usize, actual: usize) -> RunError<'static> {
+    pub fn type_error_at_least(name: &str, min: usize, actual: usize) -> RunError {
         // CPython: "get expected at least 1 argument, got 0"
         exc_fmt!(Self::TypeError; "{} expected at least {} argument, got {}", name, min, actual).into()
     }
@@ -172,7 +175,7 @@ impl ExcType {
     /// * `max` - Maximum number of allowed arguments
     /// * `actual` - Number of arguments actually provided
     #[must_use]
-    pub fn type_error_at_most<'c>(name: &str, max: usize, actual: usize) -> RunError<'c> {
+    pub fn type_error_at_most(name: &str, max: usize, actual: usize) -> RunError {
         // CPython: "get expected at most 2 arguments, got 3"
         exc_fmt!(Self::TypeError; "{} expected at most {} arguments, got {}", name, max, actual).into()
     }
@@ -181,7 +184,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `IndexError('list index out of range')`
     #[must_use]
-    pub fn list_index_error<'c>() -> RunError<'c> {
+    pub fn list_index_error() -> RunError {
         exc_static!(Self::IndexError; "list index out of range").into()
     }
 
@@ -189,7 +192,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `IndexError('tuple index out of range')`
     #[must_use]
-    pub fn tuple_index_error<'c>() -> RunError<'c> {
+    pub fn tuple_index_error() -> RunError {
         exc_static!(Self::IndexError; "tuple index out of range").into()
     }
 
@@ -197,7 +200,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `TypeError('{type}' indices must be integers, not '{index_type}')`
     #[must_use]
-    pub fn type_error_indices<'c>(type_str: &str, index_type: &str) -> RunError<'c> {
+    pub fn type_error_indices(type_str: &str, index_type: &str) -> RunError {
         exc_fmt!(Self::TypeError; "{} indices must be integers, not '{}'", type_str, index_type).into()
     }
 
@@ -205,7 +208,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `SyntaxError: name 'x' is assigned to before global declaration`
     #[must_use]
-    pub fn syntax_error_assigned_before_global<'c>(name: &str) -> SimpleException<'c> {
+    pub fn syntax_error_assigned_before_global(name: &str) -> SimpleException {
         exc_fmt!(Self::SyntaxError; "name '{}' is assigned to before global declaration", name)
     }
 
@@ -213,7 +216,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `SyntaxError: name 'x' is used prior to global declaration`
     #[must_use]
-    pub fn syntax_error_used_before_global<'c>(name: &str) -> SimpleException<'c> {
+    pub fn syntax_error_used_before_global(name: &str) -> SimpleException {
         exc_fmt!(Self::SyntaxError; "name '{}' is used prior to global declaration", name)
     }
 
@@ -221,7 +224,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `SyntaxError: nonlocal declaration not allowed at module level`
     #[must_use]
-    pub fn syntax_error_nonlocal_at_module<'c>() -> SimpleException<'c> {
+    pub fn syntax_error_nonlocal_at_module() -> SimpleException {
         exc_static!(Self::SyntaxError; "nonlocal declaration not allowed at module level")
     }
 
@@ -229,7 +232,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `SyntaxError: no binding for nonlocal 'x' found`
     #[must_use]
-    pub fn syntax_error_no_binding_nonlocal<'c>(name: &str) -> SimpleException<'c> {
+    pub fn syntax_error_no_binding_nonlocal(name: &str) -> SimpleException {
         exc_fmt!(Self::SyntaxError; "no binding for nonlocal '{}' found", name)
     }
 
@@ -237,7 +240,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `SyntaxError: name 'x' is assigned to before nonlocal declaration`
     #[must_use]
-    pub fn syntax_error_assigned_before_nonlocal<'c>(name: &str) -> SimpleException<'c> {
+    pub fn syntax_error_assigned_before_nonlocal(name: &str) -> SimpleException {
         exc_fmt!(Self::SyntaxError; "name '{}' is assigned to before nonlocal declaration", name)
     }
 
@@ -245,7 +248,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `SyntaxError: name 'x' is used prior to nonlocal declaration`
     #[must_use]
-    pub fn syntax_error_used_before_nonlocal<'c>(name: &str) -> SimpleException<'c> {
+    pub fn syntax_error_used_before_nonlocal(name: &str) -> SimpleException {
         exc_fmt!(Self::SyntaxError; "name '{}' is used prior to nonlocal declaration", name)
     }
 
@@ -254,7 +257,7 @@ impl ExcType {
     /// Matches CPython's format: `NameError: cannot access free variable 'x' where it is not
     /// associated with a value in enclosing scope`
     #[must_use]
-    pub fn name_error_free_variable<'c>(name: &str) -> SimpleException<'c> {
+    pub fn name_error_free_variable(name: &str) -> SimpleException {
         exc_fmt!(Self::NameError; "cannot access free variable '{}' where it is not associated with a value in enclosing scope", name)
     }
 
@@ -263,7 +266,7 @@ impl ExcType {
     /// Used during parsing when encountering Python syntax that Monty doesn't yet support.
     /// The message format is: "The monty syntax parser does not yet support {feature}"
     #[must_use]
-    pub fn not_implemented<'c>(feature: &str) -> SimpleException<'c> {
+    pub fn not_implemented(feature: &str) -> SimpleException {
         exc_fmt!(Self::NotImplementedError; "The monty syntax parser does not yet support {}", feature)
     }
 
@@ -271,7 +274,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `ZeroDivisionError('division by zero')`
     #[must_use]
-    pub fn zero_division<'c>() -> SimpleException<'c> {
+    pub fn zero_division() -> SimpleException {
         exc_static!(Self::ZeroDivisionError; "division by zero")
     }
 
@@ -279,7 +282,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `ZeroDivisionError('float division by zero')`
     #[must_use]
-    pub fn zero_division_float<'c>() -> SimpleException<'c> {
+    pub fn zero_division_float() -> SimpleException {
         exc_static!(Self::ZeroDivisionError; "float division by zero")
     }
 
@@ -287,7 +290,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `ZeroDivisionError('integer division or modulo by zero')`
     #[must_use]
-    pub fn zero_division_int<'c>() -> SimpleException<'c> {
+    pub fn zero_division_int() -> SimpleException {
         exc_static!(Self::ZeroDivisionError; "integer division or modulo by zero")
     }
 
@@ -295,7 +298,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `ZeroDivisionError('float floor division by zero')`
     #[must_use]
-    pub fn zero_division_float_floor<'c>() -> SimpleException<'c> {
+    pub fn zero_division_float_floor() -> SimpleException {
         exc_static!(Self::ZeroDivisionError; "float floor division by zero")
     }
 
@@ -303,7 +306,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `ZeroDivisionError('0.0 cannot be raised to a negative power')`
     #[must_use]
-    pub fn zero_pow_negative<'c>() -> SimpleException<'c> {
+    pub fn zero_pow_negative() -> SimpleException {
         exc_static!(Self::ZeroDivisionError; "0.0 cannot be raised to a negative power")
     }
 
@@ -311,7 +314,7 @@ impl ExcType {
     ///
     /// Matches CPython's format: `OverflowError('cannot fit 'int' into an index-sized integer')`
     #[must_use]
-    pub fn overflow_repeat_count<'c>() -> SimpleException<'c> {
+    pub fn overflow_repeat_count() -> SimpleException {
         exc_static!(Self::OverflowError; "cannot fit 'int' into an index-sized integer")
     }
 }
@@ -319,29 +322,23 @@ impl ExcType {
 /// Simple lightweight representation of an exception.
 ///
 /// This is used for performance reasons for common exception patterns.
+/// Exception messages use `String` for owned storage.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SimpleException<'c> {
+pub struct SimpleException {
     exc_type: ExcType,
-    arg: Option<Cow<'c, str>>,
+    arg: Option<String>,
 }
 
-impl fmt::Display for SimpleException<'_> {
+impl fmt::Display for SimpleException {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let type_str: &'static str = self.exc_type.into();
-        write!(f, "{type_str}(")?;
-
-        if let Some(arg) = &self.arg {
-            f.write_str(&string_repr(arg))?;
-        }
-
-        f.write_char(')')
+        self.py_repr_fmt(f)
     }
 }
 
-impl<'c> SimpleException<'c> {
+impl SimpleException {
     /// Creates a new exception with the given type and optional argument message.
     #[must_use]
-    pub fn new(exc_type: ExcType, arg: Option<Cow<'c, str>>) -> Self {
+    pub fn new(exc_type: ExcType, arg: Option<String>) -> Self {
         SimpleException { exc_type, arg }
     }
 
@@ -351,7 +348,7 @@ impl<'c> SimpleException<'c> {
     }
 
     #[must_use]
-    pub fn arg(&self) -> Option<&Cow<'c, str>> {
+    pub fn arg(&self) -> Option<&String> {
         self.arg.as_ref()
     }
 
@@ -372,6 +369,18 @@ impl<'c> SimpleException<'c> {
         }
     }
 
+    /// Returns the exception formatted as Python would repr it.
+    pub fn py_repr_fmt(&self, f: &mut impl Write) -> std::fmt::Result {
+        let type_str: &'static str = self.exc_type.into();
+        write!(f, "{type_str}(")?;
+
+        if let Some(arg) = &self.arg {
+            f.write_str(&string_repr(arg))?;
+        }
+
+        f.write_char(')')
+    }
+
     /// Computes a hash for this exception based on its type and argument.
     ///
     /// Used when exceptions are used as dict keys (rare but supported).
@@ -383,14 +392,14 @@ impl<'c> SimpleException<'c> {
         hasher.finish()
     }
 
-    pub(crate) fn with_frame(self, frame: StackFrame<'c>) -> ExceptionRaise<'c> {
+    pub(crate) fn with_frame(self, frame: StackFrame) -> ExceptionRaise {
         ExceptionRaise {
             exc: self,
             frame: Some(frame),
         }
     }
 
-    pub(crate) fn with_position(self, position: CodeRange<'c>) -> ExceptionRaise<'c> {
+    pub(crate) fn with_position(self, position: CodeRange) -> ExceptionRaise {
         ExceptionRaise {
             exc: self,
             frame: Some(StackFrame::from_position(position)),
@@ -405,12 +414,12 @@ impl<'c> SimpleException<'c> {
     /// For other cases, uses the generic format:
     /// `unsupported operand type(s) for {op}: '{left}' and '{right}'`
     pub(crate) fn operand_type_error<T>(
-        left: &ExprLoc<'c>,
+        left: &ExprLoc,
         op: &Operator,
-        right: &ExprLoc<'c>,
+        right: &ExprLoc,
         left_type: &str,
         right_type: &str,
-    ) -> RunResult<'c, T> {
+    ) -> RunResult<T> {
         let new_position = left.position.extend(&right.position);
 
         // CPython uses a special message for str/list + operations
@@ -420,18 +429,18 @@ impl<'c> SimpleException<'c> {
             format!("unsupported operand type(s) for {op}: '{left_type}' and '{right_type}'")
         };
 
-        Err(SimpleException::new(ExcType::TypeError, Some(message.into()))
+        Err(SimpleException::new(ExcType::TypeError, Some(message))
             .with_position(new_position)
             .into())
     }
 
     pub(crate) fn cmp_type_error<T>(
-        left: &ExprLoc<'c>,
+        left: &ExprLoc,
         op: &CmpOperator,
-        right: &ExprLoc<'c>,
+        right: &ExprLoc,
         left_type: &str,
         right_type: &str,
-    ) -> RunResult<'c, T> {
+    ) -> RunResult<T> {
         let new_position = left.position.extend(&right.position);
 
         let e =
@@ -455,7 +464,7 @@ impl<'c> SimpleException<'c> {
         } else {
             format!("unsupported operand type(s) for {op}: '{left_type}' and '{right_type}'")
         };
-        Self::new(ExcType::TypeError, Some(message.into()))
+        Self::new(ExcType::TypeError, Some(message))
     }
 }
 
@@ -488,30 +497,32 @@ macro_rules! exc_err_fmt {
 }
 pub(crate) use exc_err_fmt;
 
+/// A raised exception with optional stack frame for traceback.
 #[derive(Debug, Clone)]
-pub struct ExceptionRaise<'c> {
-    pub exc: SimpleException<'c>,
-    // first in vec is closes "bottom" frame
-    pub(crate) frame: Option<StackFrame<'c>>,
+pub struct ExceptionRaise {
+    pub exc: SimpleException,
+    /// The stack frame where the exception was raised (first in vec is closest "bottom" frame).
+    pub(crate) frame: Option<StackFrame>,
 }
 
-impl fmt::Display for ExceptionRaise<'_> {
+impl fmt::Display for ExceptionRaise {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref frame) = self.frame {
             writeln!(f, "Traceback (most recent call last):")?;
+            // Display without source line content (source not available in Display)
             write!(f, "{frame}")?;
         }
         write!(f, "{}", self.exc)
     }
 }
 
-impl<'c> From<SimpleException<'c>> for ExceptionRaise<'c> {
-    fn from(exc: SimpleException<'c>) -> Self {
+impl From<SimpleException> for ExceptionRaise {
+    fn from(exc: SimpleException) -> Self {
         ExceptionRaise { exc, frame: None }
     }
 }
 
-impl ExceptionRaise<'_> {
+impl ExceptionRaise {
     /// Returns a compact summary of the exception for test output.
     ///
     /// Format: `(position) ExceptionType('message')` or `(<no-tb>) ExceptionType('message')` if no traceback.
@@ -533,34 +544,41 @@ impl ExceptionRaise<'_> {
     }
 }
 
+/// A stack frame for traceback information.
+///
+/// Stores position information and optional function name as StringId.
+/// The actual name string must be looked up externally when formatting the traceback.
 #[derive(Debug, Clone)]
-pub struct StackFrame<'c> {
-    pub(crate) position: CodeRange<'c>,
-    /// The name of the frame (function name, or None for module-level code).
-    pub(crate) frame_name: Option<&'c str>,
-    pub(crate) parent: Option<Box<StackFrame<'c>>>,
+pub struct StackFrame {
+    pub(crate) position: CodeRange,
+    /// The name of the frame (function name StringId, or None for module-level code).
+    pub(crate) frame_name: Option<StringId>,
+    pub(crate) parent: Option<Box<StackFrame>>,
 }
 
-impl fmt::Display for StackFrame<'_> {
+impl fmt::Display for StackFrame {
+    /// Display impl for debugging - shows StringId indices.
+    /// For actual traceback output with names, use the Interns storage.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref parent) = self.parent {
             write!(f, "{parent}")?;
         }
-
-        self.position.traceback(f, self.frame_name)
+        let frame_name = self.frame_name.map(|id| format!("<name:{}>", id.index()));
+        // Display without source line content or filename (must be passed externally)
+        self.position.traceback(f, frame_name.as_deref(), "", "<file>")
     }
 }
 
-impl<'c> StackFrame<'c> {
-    pub(crate) fn new(position: &CodeRange<'c>, frame_name: &'c str, parent: Option<&StackFrame<'c>>) -> Self {
+impl StackFrame {
+    pub(crate) fn new(position: CodeRange, frame_name: StringId, parent: Option<&StackFrame>) -> Self {
         Self {
-            position: *position,
+            position,
             frame_name: Some(frame_name),
-            parent: parent.map(|parent| Box::new(parent.clone())),
+            parent: parent.map(|p| Box::new(p.clone())),
         }
     }
 
-    fn from_position(position: CodeRange<'c>) -> Self {
+    fn from_position(position: CodeRange) -> Self {
         Self {
             position,
             frame_name: None,
@@ -613,15 +631,19 @@ impl fmt::Display for InternalRunError {
     }
 }
 
+/// Runtime error types that can occur during execution.
+///
+/// Can be an internal error (bug in interpreter), a Python exception,
+/// or a resource limit error.
 #[derive(Debug, Clone)]
-pub enum RunError<'c> {
+pub enum RunError {
     Internal(InternalRunError),
-    Exc(ExceptionRaise<'c>),
+    Exc(ExceptionRaise),
     /// Resource limit exceeded (allocation, time, or memory).
     Resource(ResourceError),
 }
 
-impl fmt::Display for RunError<'_> {
+impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Internal(s) => write!(f, "{s}"),
@@ -631,25 +653,25 @@ impl fmt::Display for RunError<'_> {
     }
 }
 
-impl From<InternalRunError> for RunError<'_> {
+impl From<InternalRunError> for RunError {
     fn from(internal_error: InternalRunError) -> Self {
         Self::Internal(internal_error)
     }
 }
 
-impl<'c> From<ExceptionRaise<'c>> for RunError<'c> {
-    fn from(exc: ExceptionRaise<'c>) -> Self {
+impl From<ExceptionRaise> for RunError {
+    fn from(exc: ExceptionRaise) -> Self {
         Self::Exc(exc)
     }
 }
 
-impl<'c> From<SimpleException<'c>> for RunError<'c> {
-    fn from(exc: SimpleException<'c>) -> Self {
+impl From<SimpleException> for RunError {
+    fn from(exc: SimpleException) -> Self {
         Self::Exc(exc.into())
     }
 }
 
-impl From<ResourceError> for RunError<'_> {
+impl From<ResourceError> for RunError {
     fn from(err: ResourceError) -> Self {
         Self::Resource(err)
     }

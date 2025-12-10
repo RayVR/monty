@@ -6,7 +6,7 @@ mod not_implemented_error {
     use super::*;
 
     /// Helper to extract the exception type from a parse error.
-    fn get_exc_type(result: Result<Executor<'_>, ParseError<'_>>) -> ExcType {
+    fn get_exc_type(result: Result<Executor, ParseError>) -> ExcType {
         let err = result.expect_err("expected parse error");
         match err {
             ParseError::PreEvalExc(exc) => exc.exc.exc_type(),
@@ -15,7 +15,7 @@ mod not_implemented_error {
     }
 
     /// Helper to extract the exception message from a parse error.
-    fn get_exc_message(result: Result<Executor<'_>, ParseError<'_>>) -> String {
+    fn get_exc_message(result: Result<Executor, ParseError>) -> String {
         let err = result.expect_err("expected parse error");
         match err {
             ParseError::PreEvalExc(exc) => exc.exc.arg().map_or(String::new(), std::string::ToString::to_string),
@@ -100,7 +100,7 @@ mod syntax_error {
     use super::*;
 
     /// Helper to extract the exception type from a parse error.
-    fn get_exc_type(result: Result<Executor<'_>, ParseError<'_>>) -> ExcType {
+    fn get_exc_type(result: Result<Executor, ParseError>) -> ExcType {
         let err = result.expect_err("expected parse error");
         match err {
             ParseError::PreEvalExc(exc) => exc.exc.exc_type(),

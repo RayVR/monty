@@ -6,7 +6,7 @@ use strum::Display;
 ///
 /// Uses strum `Display` derive with per-variant serialization for operator symbols.
 #[derive(Clone, Debug, PartialEq, Display)]
-pub(crate) enum Operator {
+pub enum Operator {
     #[strum(serialize = "+")]
     Add,
     #[strum(serialize = "-")]
@@ -42,7 +42,7 @@ pub(crate) enum Operator {
 
 /// Defined separately since these operators always return a bool
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CmpOperator {
+pub enum CmpOperator {
     Eq,
     NotEq,
     Lt,

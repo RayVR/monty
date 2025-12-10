@@ -1,13 +1,11 @@
-use std::fmt::{self, Write};
-
 use crate::args::ArgExprs;
+use crate::builtins::Builtins;
 use crate::callable::Callable;
-use crate::function::Function;
+use crate::intern::{BytesId, FunctionId, StringId};
+use crate::namespace::NamespaceId;
 use crate::operators::{CmpOperator, Operator};
 use crate::parse::CodeRange;
 use crate::value::{Attr, Value};
-use crate::values::bytes::bytes_repr;
-use crate::values::str::string_repr;
 
 use crate::fstring::FStringPart;
 
@@ -19,8 +17,8 @@ use crate::fstring::FStringPart;
 /// - The `global` keyword explicitly marks a variable as Global
 /// - Variables declared `nonlocal` or implicitly captured from enclosing scopes
 ///   are accessed through Cells
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub(crate) enum NameScope {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NameScope {
     /// Variable is in the current frame's local namespace
     #[default]
     Local,
@@ -37,80 +35,94 @@ pub(crate) enum NameScope {
     Cell,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct Identifier<'c> {
-    pub position: CodeRange<'c>,
-    pub name: &'c str,
-    opt_heap_id: Option<usize>,
+/// An identifier (variable or function name) with source location and scope information.
+///
+/// The name is stored as a `StringId` which indexes into the string interner.
+/// To get the actual string, look it up in the `Interns` storage.
+#[derive(Debug, Clone, Copy)]
+pub struct Identifier {
+    pub position: CodeRange,
+    /// Interned name ID - look up in Interns to get the actual string.
+    pub name_id: StringId,
+    opt_namespace_id: Option<NamespaceId>,
     /// Which namespace this identifier refers to (determined at prepare time)
     pub scope: NameScope,
 }
 
-impl<'c> Identifier<'c> {
+impl Identifier {
     /// Creates a new identifier with unknown scope (to be resolved during prepare phase).
-    pub fn new(name: &'c str, position: CodeRange<'c>) -> Self {
+    pub fn new(name_id: StringId, position: CodeRange) -> Self {
         Self {
-            name,
+            name_id,
             position,
-            opt_heap_id: None,
+            opt_namespace_id: None,
             scope: NameScope::Local,
         }
     }
 
+    /// Returns true if this identifier is equal to another identifier.
+    ///
+    /// We assume identifiers with the same name and position in code are equal.
+    pub fn py_eq(&self, other: &Self) -> bool {
+        self.name_id == other.name_id && self.position == other.position
+    }
+
     /// Creates a new identifier with resolved namespace index and explicit scope.
-    pub fn new_with_scope(name: &'c str, position: CodeRange<'c>, heap_id: usize, scope: NameScope) -> Self {
+    pub fn new_with_scope(name_id: StringId, position: CodeRange, namespace_id: NamespaceId, scope: NameScope) -> Self {
         Self {
-            name,
+            name_id,
             position,
-            opt_heap_id: Some(heap_id),
+            opt_namespace_id: Some(namespace_id),
             scope,
         }
     }
 
-    pub fn heap_id(&self) -> usize {
-        self.opt_heap_id.expect("Identifier not prepared with heap_id")
+    pub fn namespace_id(&self) -> NamespaceId {
+        self.opt_namespace_id
+            .expect("Identifier not prepared with namespace_id")
     }
 }
 
+/// An expression in the AST.
 #[derive(Debug, Clone)]
-pub(crate) enum Expr<'c> {
+pub enum Expr {
     Literal(Literal),
-    Callable(Callable<'c>),
-    Name(Identifier<'c>),
+    Builtin(Builtins),
+    Name(Identifier),
     /// Function call expression.
     ///
     /// The `callable` can be a Builtin, ExcType (resolved at parse time), or a Name
     /// that will be looked up in the namespace at runtime.
     Call {
-        callable: Callable<'c>,
-        args: ArgExprs<'c>,
+        callable: Callable,
+        args: ArgExprs,
     },
     AttrCall {
-        object: Identifier<'c>,
+        object: Identifier,
         attr: Attr,
-        args: ArgExprs<'c>,
+        args: ArgExprs,
     },
     Op {
-        left: Box<ExprLoc<'c>>,
+        left: Box<ExprLoc>,
         op: Operator,
-        right: Box<ExprLoc<'c>>,
+        right: Box<ExprLoc>,
     },
     CmpOp {
-        left: Box<ExprLoc<'c>>,
+        left: Box<ExprLoc>,
         op: CmpOperator,
-        right: Box<ExprLoc<'c>>,
+        right: Box<ExprLoc>,
     },
-    List(Vec<ExprLoc<'c>>),
-    Tuple(Vec<ExprLoc<'c>>),
+    List(Vec<ExprLoc>),
+    Tuple(Vec<ExprLoc>),
     Subscript {
-        object: Box<ExprLoc<'c>>,
-        index: Box<ExprLoc<'c>>,
+        object: Box<ExprLoc>,
+        index: Box<ExprLoc>,
     },
-    Dict(Vec<(ExprLoc<'c>, ExprLoc<'c>)>),
+    Dict(Vec<(ExprLoc, ExprLoc)>),
     /// Unary `not` expression - evaluates to the boolean negation of the operand's truthiness.
-    Not(Box<ExprLoc<'c>>),
+    Not(Box<ExprLoc>),
     /// Unary minus expression - negates a numeric value.
-    UnaryMinus(Box<ExprLoc<'c>>),
+    UnaryMinus(Box<ExprLoc>),
     /// F-string expression containing literal and interpolated parts.
     ///
     /// At evaluation time, each part is processed in sequence:
@@ -118,86 +130,19 @@ pub(crate) enum Expr<'c> {
     /// - Interpolation parts have their expression evaluated, converted, and formatted
     ///
     /// The results are concatenated to produce the final string.
-    FString(Vec<FStringPart<'c>>),
+    FString(Vec<FStringPart>),
     /// Conditional expression (ternary operator): `body if test else orelse`
     ///
     /// Only one of body/orelse is evaluated based on the truthiness of test.
     /// This implements short-circuit evaluation - the branch not taken is never executed.
     IfElse {
-        test: Box<ExprLoc<'c>>,
-        body: Box<ExprLoc<'c>>,
-        orelse: Box<ExprLoc<'c>>,
+        test: Box<ExprLoc>,
+        body: Box<ExprLoc>,
+        orelse: Box<ExprLoc>,
     },
 }
 
-impl fmt::Display for Expr<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Literal(literal) => write!(f, "{literal}"),
-            Self::Callable(callable) => write!(f, "{callable}"),
-            Self::Name(identifier) => f.write_str(identifier.name),
-            Self::Call { callable, args } => write!(f, "{callable}{args}"),
-            Self::AttrCall { object, attr, args } => write!(f, "{}.{}{}", object.name, attr, args),
-            Self::Op { left, op, right } => write!(f, "{left} {op} {right}"),
-            Self::CmpOp { left, op, right } => write!(f, "{left} {op} {right}"),
-            Self::List(itms) => {
-                write!(
-                    f,
-                    "[{}]",
-                    itms.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-                )
-            }
-            Self::Tuple(itms) => {
-                write!(
-                    f,
-                    "({})",
-                    itms.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-                )
-            }
-            Self::Subscript { object, index } => write!(f, "{object}[{index}]"),
-            Self::Dict(pairs) => {
-                if pairs.is_empty() {
-                    f.write_str("{}")
-                } else {
-                    f.write_char('{')?;
-                    let mut iter = pairs.iter();
-                    if let Some((k, v)) = iter.next() {
-                        write!(f, "{k}: {v}")?;
-                    }
-                    for (k, v) in iter {
-                        write!(f, ", {k}: {v}")?;
-                    }
-                    f.write_char('}')
-                }
-            }
-            Self::Not(operand) => write!(f, "not {operand}"),
-            Self::UnaryMinus(operand) => write!(f, "-{operand}"),
-            Self::FString(parts) => {
-                f.write_str("f\"")?;
-                for part in parts {
-                    match part {
-                        FStringPart::Literal(s) => f.write_str(s)?,
-                        FStringPart::Interpolation {
-                            expr,
-                            conversion,
-                            format_spec,
-                        } => {
-                            write!(f, "{{{expr}{conversion}")?;
-                            if let Some(spec) = format_spec {
-                                write!(f, ":{spec}")?;
-                            }
-                            f.write_char('}')?;
-                        }
-                    }
-                }
-                f.write_char('"')
-            }
-            Self::IfElse { test, body, orelse } => write!(f, "{body} if {test} else {orelse}"),
-        }
-    }
-}
-
-impl Expr<'_> {
+impl Expr {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::Literal(Literal::None))
     }
@@ -212,110 +157,92 @@ impl Expr<'_> {
 ///
 /// Note: unlike the AST `Constant` type, we store tuples only as expressions since they
 /// can't always be recorded as constants.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Literal {
     Ellipsis,
     None,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(String),
-    Bytes(Vec<u8>),
+    /// An interned string literal. The StringId references the string in the Interns table.
+    Str(StringId),
+    /// An interned bytes literal. The BytesId references the bytes in the Interns table.
+    Bytes(BytesId),
 }
 
-impl Literal {
+impl From<Literal> for Value {
     /// Converts the literal into its runtime `Value` counterpart.
     ///
     /// This is the only place parse-time data crosses the boundary into runtime
     /// semantics, ensuring every literal follows the same conversion path.
-    pub fn to_value<'c>(&self) -> Value<'c, '_> {
-        match self {
-            Self::Ellipsis => Value::Ellipsis,
-            Self::None => Value::None,
-            Self::Bool(b) => Value::Bool(*b),
-            Self::Int(v) => Value::Int(*v),
-            Self::Float(v) => Value::Float(*v),
-            Self::Str(s) => Value::InternString(s),
-            Self::Bytes(b) => Value::InternBytes(b),
+    fn from(literal: Literal) -> Self {
+        match literal {
+            Literal::Ellipsis => Self::Ellipsis,
+            Literal::None => Self::None,
+            Literal::Bool(b) => Self::Bool(b),
+            Literal::Int(v) => Self::Int(v),
+            Literal::Float(v) => Self::Float(v),
+            Literal::Str(string_id) => Self::InternString(string_id),
+            Literal::Bytes(bytes_id) => Self::InternBytes(bytes_id),
         }
     }
 }
 
-impl fmt::Display for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ellipsis => f.write_str("..."),
-            Self::None => f.write_str("None"),
-            Self::Bool(true) => f.write_str("True"),
-            Self::Bool(false) => f.write_str("False"),
-            Self::Int(v) => write!(f, "{v}"),
-            Self::Float(v) => write!(f, "{v}"),
-            Self::Str(v) => f.write_str(&string_repr(v)),
-            Self::Bytes(v) => f.write_str(&bytes_repr(v)),
-        }
-    }
-}
-
+/// An expression with its source location.
 #[derive(Debug, Clone)]
-pub(crate) struct ExprLoc<'c> {
-    pub position: CodeRange<'c>,
-    pub expr: Expr<'c>,
+pub struct ExprLoc {
+    pub position: CodeRange,
+    pub expr: Expr,
 }
 
-impl fmt::Display for ExprLoc<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // don't show position as that should be displayed separately
-        write!(f, "{}", self.expr)
-    }
-}
-
-impl<'c> ExprLoc<'c> {
-    pub fn new(position: CodeRange<'c>, expr: Expr<'c>) -> Self {
+impl ExprLoc {
+    pub fn new(position: CodeRange, expr: Expr) -> Self {
         Self { position, expr }
     }
 }
 
+/// A prepared AST node ready for execution.
 #[derive(Debug, Clone)]
-pub(crate) enum Node<'c> {
-    Expr(ExprLoc<'c>),
-    Return(ExprLoc<'c>),
+pub enum Node {
+    Expr(ExprLoc),
+    Return(ExprLoc),
     ReturnNone,
-    Raise(Option<ExprLoc<'c>>),
+    Raise(Option<ExprLoc>),
     Assert {
-        test: ExprLoc<'c>,
-        msg: Option<ExprLoc<'c>>,
+        test: ExprLoc,
+        msg: Option<ExprLoc>,
     },
     Assign {
-        target: Identifier<'c>,
-        object: ExprLoc<'c>,
+        target: Identifier,
+        object: ExprLoc,
     },
     OpAssign {
-        target: Identifier<'c>,
+        target: Identifier,
         op: Operator,
-        object: ExprLoc<'c>,
+        object: ExprLoc,
     },
     SubscriptAssign {
-        target: Identifier<'c>,
-        index: ExprLoc<'c>,
-        value: ExprLoc<'c>,
+        target: Identifier,
+        index: ExprLoc,
+        value: ExprLoc,
     },
     For {
-        target: Identifier<'c>,
-        iter: ExprLoc<'c>,
-        body: Vec<Node<'c>>,
-        or_else: Vec<Node<'c>>,
+        target: Identifier,
+        iter: ExprLoc,
+        body: Vec<Node>,
+        or_else: Vec<Node>,
     },
     If {
-        test: ExprLoc<'c>,
-        body: Vec<Node<'c>>,
-        or_else: Vec<Node<'c>>,
+        test: ExprLoc,
+        body: Vec<Node>,
+        or_else: Vec<Node>,
     },
-    FunctionDef(Function<'c>),
+    FunctionDef(FunctionId),
 }
 
-// TODO move to run
+/// Result of executing a frame - either a return value or (future) yield.
 #[derive(Debug)]
-pub enum FrameExit<'c, 'e> {
-    Return(Value<'c, 'e>),
+pub enum FrameExit {
+    Return(Value),
     // Yield(Value),
 }

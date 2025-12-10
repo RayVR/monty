@@ -8,8 +8,10 @@ use crate::exceptions::{ExcType, ExceptionRaise, SimpleException};
 use crate::expressions::{Expr, ExprLoc, Identifier, Literal, NameScope, Node};
 use crate::fstring::{FStringPart, FormatSpec};
 use crate::function::Function;
+use crate::intern::{FunctionId, InternerBuilder, StringId};
+use crate::namespace::NamespaceId;
 use crate::operators::{CmpOperator, Operator};
-use crate::parse::ParseNode;
+use crate::parse::{ParseNode, ParseResult};
 use crate::parse_error::ParseError;
 
 /// Result of the prepare phase, containing everything needed to execute code.
@@ -18,33 +20,39 @@ use crate::parse_error::ParseError;
 /// - The initial namespace with placeholder values for each variable
 /// - A mapping from variable names to their namespace indices (for ref-count testing)
 /// - The transformed AST nodes ready for execution
-pub(crate) struct PrepareResult<'c> {
+/// - The string interner containing all interned identifiers and filenames
+pub struct PrepareResult {
     /// Number of items in the namespace (at module level, this IS the global namespace)
     pub namespace_size: usize,
     /// Maps variable names to their indices in the namespace.
     /// Used for ref-count testing to look up variables by name.
     /// Only available when the `ref-counting` feature is enabled.
     #[cfg(feature = "ref-counting")]
-    pub name_map: AHashMap<String, usize>,
+    pub name_map: AHashMap<String, NamespaceId>,
     /// The prepared AST nodes with all names resolved to namespace indices.
-    pub nodes: Vec<Node<'c>>,
+    pub nodes: Vec<Node>,
+    /// The string interner containing all interned identifiers and filenames.
+    pub interner: InternerBuilder,
+    /// The functions defined in the module.
+    pub functions: Vec<Function>,
 }
 
 /// Prepares parsed nodes for execution by resolving names and building the initial namespace.
 ///
 /// The namespace will be converted to runtime Objects when execution begins and the heap is available.
 /// At module level, the local namespace IS the global namespace.
-pub(crate) fn prepare<'c>(
-    nodes: Vec<ParseNode<'c>>,
-    input_names: &[&str],
-) -> Result<PrepareResult<'c>, ParseError<'c>> {
-    let mut p = Prepare::new_module(nodes.len(), input_names);
+pub(crate) fn prepare(parse_result: ParseResult, input_names: &[&str]) -> Result<PrepareResult, ParseError> {
+    let ParseResult { nodes, interner } = parse_result;
+    let mut functions = Vec::new();
+    let mut p = Prepare::new_module(nodes.len(), input_names, &interner, &mut functions);
     let prepared_nodes = p.prepare_nodes(nodes)?;
     Ok(PrepareResult {
         namespace_size: p.namespace_size,
         #[cfg(feature = "ref-counting")]
         name_map: p.name_map,
         nodes: prepared_nodes,
+        interner,
+        functions,
     })
 }
 
@@ -61,9 +69,13 @@ pub(crate) fn prepare<'c>(
 /// - Which variables are assigned locally (determines local vs global scope)
 /// - Reference to the global name map for resolving global variable references
 /// - Enclosing scope information for closure analysis
-struct Prepare {
+struct Prepare<'i> {
+    /// Reference to the string interner for looking up names in error messages.
+    interner: &'i InternerBuilder,
+    /// container for functions
+    functions: &'i mut Vec<Function>,
     /// Maps variable names to their indices in this scope's namespace vector
-    name_map: AHashMap<String, usize>,
+    name_map: AHashMap<String, NamespaceId>,
     /// Number of items in the namespace
     pub namespace_size: usize,
     /// Root frame is the outer frame of the script, e.g. the "global" scope.
@@ -84,7 +96,7 @@ struct Prepare {
     /// Copy of the module-level global name map.
     /// Used by functions to resolve global variable references.
     /// None at module level (not needed since all names are global there).
-    global_name_map: Option<AHashMap<String, usize>>,
+    global_name_map: Option<AHashMap<String, NamespaceId>>,
     /// Names that exist as locals in the enclosing function scope.
     /// Used to validate `nonlocal` declarations and resolve captured variables.
     /// None at module level or when there's no enclosing function.
@@ -92,15 +104,15 @@ struct Prepare {
     /// Maps free variable names (from nonlocal declarations and implicit captures) to their
     /// index in the free_vars vector. Pre-populated with nonlocal names at initialization,
     /// then extended with implicit captures discovered during preparation.
-    free_var_map: AHashMap<String, usize>,
+    free_var_map: AHashMap<String, NamespaceId>,
     /// Maps cell variable names to their index in the owned_cells vector.
     /// Pre-populated with cell_var names at initialization (excluding pass-through variables
     /// that are both nonlocal and captured by nested functions), then extended as new
     /// captures are discovered during nested function preparation.
-    cell_var_map: AHashMap<String, usize>,
+    cell_var_map: AHashMap<String, NamespaceId>,
 }
 
-impl Prepare {
+impl<'i> Prepare<'i> {
     /// Creates a new Prepare instance for module-level code.
     ///
     /// At module level, all variables are global. The `global` keyword is a no-op
@@ -109,13 +121,21 @@ impl Prepare {
     /// # Arguments
     /// * `capacity` - Expected number of nodes, used to preallocate the name map
     /// * `input_names` - Names that should be pre-registered in the namespace (e.g., external variables)
-    fn new_module(capacity: usize, input_names: &[&str]) -> Self {
+    /// * `interner` - Reference to the string interner for looking up names
+    /// * `functions` - Reference to the functions container
+    fn new_module(
+        capacity: usize,
+        input_names: &[&str],
+        interner: &'i InternerBuilder,
+        functions: &'i mut Vec<Function>,
+    ) -> Self {
         let mut name_map = AHashMap::with_capacity(capacity);
         for (index, name) in input_names.iter().enumerate() {
-            name_map.insert((*name).to_string(), index);
+            name_map.insert((*name).to_string(), NamespaceId::new(index));
         }
         let namespace_size = name_map.len();
         Self {
+            interner,
             name_map,
             namespace_size,
             root_frame: true,
@@ -127,6 +147,7 @@ impl Prepare {
             enclosing_locals: None,
             free_var_map: AHashMap::new(),
             cell_var_map: AHashMap::new(),
+            functions,
         }
     }
 
@@ -137,27 +158,30 @@ impl Prepare {
     ///
     /// # Arguments
     /// * `capacity` - Expected number of nodes
-    /// * `params` - Function parameter names (pre-registered in namespace)
+    /// * `params` - Function parameter StringIds (pre-registered in namespace)
     /// * `assigned_names` - Names that are assigned in this function (from first-pass scan)
     /// * `global_names` - Names declared as `global` in this function
     /// * `nonlocal_names` - Names declared as `nonlocal` in this function
     /// * `global_name_map` - Copy of the module-level name map for global resolution
     /// * `enclosing_locals` - Names that exist as locals in the enclosing function (for nonlocal resolution)
     /// * `cell_var_names` - Names that are captured by nested functions (must be stored in cells)
+    /// * `interner` - Reference to the string interner for looking up names
     #[allow(clippy::too_many_arguments)]
     fn new_function(
         capacity: usize,
-        params: &[&str],
+        params: &[StringId],
         assigned_names: AHashSet<String>,
         global_names: AHashSet<String>,
         nonlocal_names: AHashSet<String>,
-        global_name_map: AHashMap<String, usize>,
+        global_name_map: AHashMap<String, NamespaceId>,
         enclosing_locals: Option<AHashSet<String>>,
         cell_var_names: AHashSet<String>,
+        interner: &'i InternerBuilder,
+        functions: &'i mut Vec<Function>,
     ) -> Self {
         let mut name_map = AHashMap::with_capacity(capacity);
-        for (index, name) in params.iter().enumerate() {
-            name_map.insert((*name).to_string(), index);
+        for (index, string_id) in params.iter().enumerate() {
+            name_map.insert(interner.get(*string_id).to_string(), NamespaceId::new(index));
         }
         let namespace_size = name_map.len();
 
@@ -175,7 +199,7 @@ impl Prepare {
             if !nonlocal_names.contains(&name) {
                 let slot = namespace_size;
                 namespace_size += 1;
-                cell_var_map.insert(name, slot);
+                cell_var_map.insert(name, NamespaceId::new(slot));
             }
         }
 
@@ -187,10 +211,11 @@ impl Prepare {
         for name in nonlocal_names {
             let slot = namespace_size;
             namespace_size += 1;
-            free_var_map.insert(name, slot);
+            free_var_map.insert(name, NamespaceId::new(slot));
         }
 
         Self {
+            interner,
             name_map,
             namespace_size,
             root_frame: false,
@@ -202,6 +227,7 @@ impl Prepare {
             enclosing_locals,
             free_var_map,
             cell_var_map,
+            functions,
         }
     }
 
@@ -215,7 +241,7 @@ impl Prepare {
     ///
     /// # Returns
     /// A vector of prepared nodes ready for execution
-    fn prepare_nodes<'c>(&mut self, nodes: Vec<ParseNode<'c>>) -> Result<Vec<Node<'c>>, ParseError<'c>> {
+    fn prepare_nodes(&mut self, nodes: Vec<ParseNode>) -> Result<Vec<Node>, ParseError> {
         let nodes_len = nodes.len();
         let mut new_nodes = Vec::with_capacity(nodes_len);
         for (index, node) in nodes.into_iter().enumerate() {
@@ -244,17 +270,10 @@ impl Prepare {
                                 // Handle raising an exception type constant without instantiation,
                                 // e.g. `raise TypeError`. This is transformed into a call: `raise TypeError()`
                                 // so the exception is properly instantiated before being raised.
-                                Expr::Callable(Callable::ExcType(exc_type)) => {
+                                // Also handle raising a builtin constant (unlikely but consistent)
+                                Expr::Builtin(b) => {
                                     let call_expr = Expr::Call {
-                                        callable: Callable::ExcType(exc_type),
-                                        args: ArgExprs::Zero,
-                                    };
-                                    Some(ExprLoc::new(expr.position, call_expr))
-                                }
-                                // Handle raising a builtin constant (unlikely but consistent)
-                                Expr::Callable(Callable::Builtin(builtin)) => {
-                                    let call_expr = Expr::Call {
-                                        callable: Callable::Builtin(builtin),
+                                        callable: Callable::Builtin(b),
                                         args: ArgExprs::Zero,
                                     };
                                     Some(ExprLoc::new(expr.position, call_expr))
@@ -265,9 +284,9 @@ impl Prepare {
                                     let position = id.position;
                                     let (resolved_id, is_new) = self.get_id(id);
                                     if is_new {
+                                        let name_str = self.interner.get(resolved_id.name_id).to_string();
                                         let exc: ExceptionRaise =
-                                            SimpleException::new(ExcType::NameError, Some(resolved_id.name.into()))
-                                                .into();
+                                            SimpleException::new(ExcType::NameError, Some(name_str)).into();
                                         return Err(exc.into());
                                     }
                                     Some(ExprLoc::new(position, Expr::Name(resolved_id)))
@@ -290,13 +309,15 @@ impl Prepare {
                 ParseNode::Assign { target, object } => {
                     let object = self.prepare_expression(object)?;
                     // Track that this name was assigned before we call get_id
-                    self.names_assigned_in_order.insert(target.name.to_string());
+                    self.names_assigned_in_order
+                        .insert(self.interner.get(target.name_id).to_string());
                     let (target, _) = self.get_id(target);
                     new_nodes.push(Node::Assign { target, object });
                 }
                 ParseNode::OpAssign { target, op, object } => {
                     // Track that this name was assigned
-                    self.names_assigned_in_order.insert(target.name.to_string());
+                    self.names_assigned_in_order
+                        .insert(self.interner.get(target.name_id).to_string());
                     let target = self.get_id(target).0;
                     let object = self.prepare_expression(object)?;
                     new_nodes.push(Node::OpAssign { target, op, object });
@@ -315,7 +336,8 @@ impl Prepare {
                     or_else,
                 } => {
                     // Track that the loop variable is assigned
-                    self.names_assigned_in_order.insert(target.name.to_string());
+                    self.names_assigned_in_order
+                        .insert(self.interner.get(target.name_id).to_string());
                     new_nodes.push(Node::For {
                         target: self.get_id(target).0,
                         iter: self.prepare_expression(iter)?,
@@ -340,15 +362,16 @@ impl Prepare {
                     // The actual effect happens in get_id where we check global_names.
                     if !self.is_module_scope {
                         // Validate that names weren't already used/assigned before `global` declaration
-                        for name in names {
-                            let name_str = name.to_string();
+                        for string_id in names {
+                            let name_str = self.interner.get(string_id).to_string();
                             if self.names_assigned_in_order.contains(&name_str) {
                                 // Name was assigned before the global declaration
-                                let exc: ExceptionRaise = ExcType::syntax_error_assigned_before_global(name).into();
+                                let exc: ExceptionRaise =
+                                    ExcType::syntax_error_assigned_before_global(&name_str).into();
                                 return Err(exc.into());
                             } else if self.name_map.contains_key(&name_str) {
                                 // Name was used (but not assigned) before the global declaration
-                                let exc: ExceptionRaise = ExcType::syntax_error_used_before_global(name).into();
+                                let exc: ExceptionRaise = ExcType::syntax_error_used_before_global(&name_str).into();
                                 return Err(exc.into());
                             }
                         }
@@ -363,27 +386,27 @@ impl Prepare {
                     }
                     // Validate that names weren't already used/assigned before `nonlocal` declaration
                     // and that the binding exists in an enclosing scope
-                    for name in names {
-                        let name_str = name.to_string();
+                    for string_id in names {
+                        let name_str = self.interner.get(string_id).to_string();
                         if self.names_assigned_in_order.contains(&name_str) {
                             // Name was assigned before the nonlocal declaration
-                            let exc: ExceptionRaise = ExcType::syntax_error_assigned_before_nonlocal(name).into();
+                            let exc: ExceptionRaise = ExcType::syntax_error_assigned_before_nonlocal(&name_str).into();
                             return Err(exc.into());
                         } else if self.name_map.contains_key(&name_str) {
                             // Name was used (but not assigned) before the nonlocal declaration
-                            let exc: ExceptionRaise = ExcType::syntax_error_used_before_nonlocal(name).into();
+                            let exc: ExceptionRaise = ExcType::syntax_error_used_before_nonlocal(&name_str).into();
                             return Err(exc.into());
                         }
                         // Validate that the binding exists in an enclosing scope
                         if let Some(ref enclosing) = self.enclosing_locals {
                             if !enclosing.contains(&name_str) {
-                                let exc: ExceptionRaise = ExcType::syntax_error_no_binding_nonlocal(name).into();
+                                let exc: ExceptionRaise = ExcType::syntax_error_no_binding_nonlocal(&name_str).into();
                                 return Err(exc.into());
                             }
                         } else {
                             // No enclosing scope (function defined at module level)
                             // The nonlocal must reference something in an enclosing function
-                            let exc: ExceptionRaise = ExcType::syntax_error_no_binding_nonlocal(name).into();
+                            let exc: ExceptionRaise = ExcType::syntax_error_no_binding_nonlocal(&name_str).into();
                             return Err(exc.into());
                         }
                     }
@@ -406,11 +429,11 @@ impl Prepare {
     ///
     /// # Errors
     /// Returns a NameError if an attribute call references an undefined variable
-    fn prepare_expression<'c>(&mut self, loc_expr: ExprLoc<'c>) -> Result<ExprLoc<'c>, ParseError<'c>> {
+    fn prepare_expression(&mut self, loc_expr: ExprLoc) -> Result<ExprLoc, ParseError> {
         let ExprLoc { position, expr } = loc_expr;
         let expr = match expr {
             Expr::Literal(object) => Expr::Literal(object),
-            Expr::Callable(callable) => Expr::Callable(callable),
+            Expr::Builtin(callable) => Expr::Builtin(callable),
             Expr::Name(name) => Expr::Name(self.get_id(name).0),
             Expr::Op { left, op, right } => Expr::Op {
                 left: Box::new(self.prepare_expression(*left)?),
@@ -432,15 +455,14 @@ impl Prepare {
                         // Unlike regular name lookups, calling requires the name to already exist.
                         // Calling an undefined variable should fail at prepare-time, not runtime.
                         if is_new {
-                            let exc: ExceptionRaise =
-                                SimpleException::new(ExcType::NameError, Some(resolved_ident.name.to_owned().into()))
-                                    .into();
+                            let name_str = self.interner.get(resolved_ident.name_id).to_string();
+                            let exc: ExceptionRaise = SimpleException::new(ExcType::NameError, Some(name_str)).into();
                             return Err(exc.into());
                         }
                         Callable::Name(resolved_ident)
                     }
-                    // Builtins and ExcTypes are already resolved at parse time
-                    other => other,
+                    // Builtins are already resolved at parse time
+                    other @ Callable::Builtin(_) => other,
                 };
                 Expr::Call { callable, args }
             }
@@ -450,8 +472,8 @@ impl Prepare {
                 // Calling a method on an undefined variable should fail at prepare-time, not runtime.
                 // Example: `undefined_var.method()` should raise NameError here.
                 if is_new {
-                    let exc: ExceptionRaise =
-                        SimpleException::new(ExcType::NameError, Some(object.name.to_owned().into())).into();
+                    let name_str = self.interner.get(object.name_id).to_string();
+                    let exc: ExceptionRaise = SimpleException::new(ExcType::NameError, Some(name_str)).into();
                     return Err(exc.into());
                 }
                 args.prepare_args(|expr| self.prepare_expression(expr))?;
@@ -461,14 +483,14 @@ impl Prepare {
                 let expressions = elements
                     .into_iter()
                     .map(|e| self.prepare_expression(e))
-                    .collect::<Result<_, ParseError<'c>>>()?;
+                    .collect::<Result<_, ParseError>>()?;
                 Expr::List(expressions)
             }
             Expr::Tuple(elements) => {
                 let expressions = elements
                     .into_iter()
                     .map(|e| self.prepare_expression(e))
-                    .collect::<Result<_, ParseError<'c>>>()?;
+                    .collect::<Result<_, ParseError>>()?;
                 Expr::Tuple(expressions)
             }
             Expr::Subscript { object, index } => Expr::Subscript {
@@ -479,7 +501,7 @@ impl Prepare {
                 let prepared_pairs = pairs
                     .into_iter()
                     .map(|(k, v)| Ok((self.prepare_expression(k)?, self.prepare_expression(v)?)))
-                    .collect::<Result<_, ParseError<'c>>>()?;
+                    .collect::<Result<_, ParseError>>()?;
                 Expr::Dict(prepared_pairs)
             }
             Expr::Not(operand) => Expr::Not(Box::new(self.prepare_expression(*operand)?)),
@@ -488,7 +510,7 @@ impl Prepare {
                 let prepared_parts = parts
                     .into_iter()
                     .map(|part| self.prepare_fstring_part(part))
-                    .collect::<Result<Vec<_>, ParseError<'c>>>()?;
+                    .collect::<Result<Vec<_>, ParseError>>()?;
                 Expr::FString(prepared_parts)
             }
             Expr::IfElse { test, body, orelse } => Expr::IfElse {
@@ -545,17 +567,17 @@ impl Prepare {
     /// When the nested function uses `nonlocal` declarations, those names must exist
     /// in an enclosing scope. The enclosing scope's variable becomes a cell_var
     /// (stored in a heap cell), and the nested function captures it as a free_var.
-    fn prepare_function_def<'c>(
+    fn prepare_function_def(
         &mut self,
-        name: Identifier<'c>,
-        params: Vec<&'c str>,
-        body: Vec<ParseNode<'c>>,
-    ) -> Result<Node<'c>, ParseError<'c>> {
+        name: Identifier,
+        params: Vec<StringId>,
+        body: Vec<ParseNode>,
+    ) -> Result<Node, ParseError> {
         // Register the function name in the current scope
         let (name, _) = self.get_id(name);
 
         // Pass 1: Collect scope information from the function body
-        let scope_info = collect_function_scope_info(&body, &params);
+        let scope_info = collect_function_scope_info(&body, &params, self.interner);
 
         // Get the global name map to pass to the function preparer
         // At module level, use our own name_map; otherwise use the inherited global_name_map
@@ -591,6 +613,8 @@ impl Prepare {
             global_name_map,
             Some(enclosing_locals),
             scope_info.cell_var_names,
+            self.interner,
+            self.functions,
         );
 
         // Prepare the function body
@@ -606,7 +630,7 @@ impl Prepare {
                 let slot = match self.name_map.entry(captured_name.clone()) {
                     Entry::Occupied(e) => *e.get(),
                     Entry::Vacant(e) => {
-                        let slot = self.namespace_size;
+                        let slot = NamespaceId::new(self.namespace_size);
                         self.namespace_size += 1;
                         e.insert(slot);
                         slot
@@ -622,7 +646,7 @@ impl Prepare {
         let mut free_var_entries: Vec<_> = inner_prepare.free_var_map.into_iter().collect();
         free_var_entries.sort_by_key(|(_, our_slot)| *our_slot);
 
-        let free_var_enclosing_slots: Vec<usize> = free_var_entries
+        let free_var_enclosing_slots: Vec<NamespaceId> = free_var_entries
             .into_iter()
             .map(|(var_name, _our_slot)| {
                 // Determine the namespace slot in the enclosing scope where the cell reference lives:
@@ -642,16 +666,19 @@ impl Prepare {
         // cell_var_count: number of cells to create at call time for variables captured by nested functions
         // Slots are implicitly params.len()..params.len()+cell_var_count in the namespace layout
         let cell_var_count = inner_prepare.cell_var_map.len();
-
-        // Return the final FunctionDef node
-        Ok(Node::FunctionDef(Function::new(
+        let namespace_size = inner_prepare.namespace_size;
+        let function_id = FunctionId::new(self.functions.len());
+        self.functions.push(Function::new(
             name,
             params,
             prepared_body,
-            inner_prepare.namespace_size,
+            namespace_size,
             free_var_enclosing_slots,
             cell_var_count,
-        )))
+        ));
+
+        // Return the final FunctionDef node
+        Ok(Node::FunctionDef(function_id))
     }
 
     /// Resolves an identifier to its namespace index and scope, creating a new entry if needed.
@@ -669,22 +696,22 @@ impl Prepare {
     ///
     /// # Returns
     /// A tuple of (resolved Identifier with id and scope set, whether this is a new local name).
-    fn get_id<'c>(&mut self, ident: Identifier<'c>) -> (Identifier<'c>, bool) {
-        let name_str = ident.name.to_owned();
+    fn get_id(&mut self, ident: Identifier) -> (Identifier, bool) {
+        let name_str = self.interner.get(ident.name_id).to_string();
 
         // At module level, all names are local (which is also the global namespace)
         if self.is_module_scope {
             let (id, is_new) = match self.name_map.entry(name_str) {
                 Entry::Occupied(e) => (*e.get(), false),
                 Entry::Vacant(e) => {
-                    let id = self.namespace_size;
+                    let id = NamespaceId::new(self.namespace_size);
                     self.namespace_size += 1;
                     e.insert(id);
                     (id, true)
                 }
             };
             return (
-                Identifier::new_with_scope(ident.name, ident.position, id, NameScope::Local),
+                Identifier::new_with_scope(ident.name_id, ident.position, id, NameScope::Local),
                 is_new,
             );
         }
@@ -697,7 +724,7 @@ impl Prepare {
                 if let Some(&global_id) = global_map.get(&name_str) {
                     // Name exists in global namespace
                     return (
-                        Identifier::new_with_scope(ident.name, ident.position, global_id, NameScope::Global),
+                        Identifier::new_with_scope(ident.name_id, ident.position, global_id, NameScope::Global),
                         false,
                     );
                 }
@@ -712,7 +739,7 @@ impl Prepare {
             let (id, is_new) = match self.name_map.entry(name_str) {
                 Entry::Occupied(e) => (*e.get(), false),
                 Entry::Vacant(e) => {
-                    let id = self.namespace_size;
+                    let id = NamespaceId::new(self.namespace_size);
                     self.namespace_size += 1;
                     e.insert(id);
                     (id, true)
@@ -720,7 +747,7 @@ impl Prepare {
             };
             // Mark as Global scope - runtime will need to handle this specially
             return (
-                Identifier::new_with_scope(ident.name, ident.position, id, NameScope::Global),
+                Identifier::new_with_scope(ident.name_id, ident.position, id, NameScope::Global),
                 is_new,
             );
         }
@@ -730,7 +757,7 @@ impl Prepare {
         if let Some(&slot) = self.free_var_map.get(&name_str) {
             // At runtime, the cell reference is in namespace[slot] as Value::Ref(cell_id)
             return (
-                Identifier::new_with_scope(ident.name, ident.position, slot, NameScope::Cell),
+                Identifier::new_with_scope(ident.name_id, ident.position, slot, NameScope::Cell),
                 false, // Not a new local - it's captured from enclosing scope
             );
         }
@@ -741,7 +768,7 @@ impl Prepare {
         if let Some(&slot) = self.cell_var_map.get(&name_str) {
             // The namespace slot was already allocated when cell_var_map was populated
             return (
-                Identifier::new_with_scope(ident.name, ident.position, slot, NameScope::Cell),
+                Identifier::new_with_scope(ident.name_id, ident.position, slot, NameScope::Cell),
                 false, // Not a "new" local - it's a cell variable
             );
         }
@@ -751,14 +778,14 @@ impl Prepare {
             let (id, is_new) = match self.name_map.entry(name_str) {
                 Entry::Occupied(e) => (*e.get(), false),
                 Entry::Vacant(e) => {
-                    let id = self.namespace_size;
+                    let id = NamespaceId::new(self.namespace_size);
                     self.namespace_size += 1;
                     e.insert(id);
                     (id, true)
                 }
             };
             return (
-                Identifier::new_with_scope(ident.name, ident.position, id, NameScope::Local),
+                Identifier::new_with_scope(ident.name_id, ident.position, id, NameScope::Local),
                 is_new,
             );
         }
@@ -772,14 +799,14 @@ impl Prepare {
                     existing_slot
                 } else {
                     // Allocate a namespace slot for this free variable
-                    let slot = self.namespace_size;
+                    let slot = NamespaceId::new(self.namespace_size);
                     self.namespace_size += 1;
                     self.name_map.insert(name_str.clone(), slot);
                     self.free_var_map.insert(name_str, slot);
                     slot
                 };
                 return (
-                    Identifier::new_with_scope(ident.name, ident.position, slot, NameScope::Cell),
+                    Identifier::new_with_scope(ident.name_id, ident.position, slot, NameScope::Cell),
                     false, // Not a new local - it's captured from enclosing scope
                 );
             }
@@ -789,7 +816,7 @@ impl Prepare {
         if let Some(ref global_map) = self.global_name_map {
             if let Some(&global_id) = global_map.get(&name_str) {
                 return (
-                    Identifier::new_with_scope(ident.name, ident.position, global_id, NameScope::Global),
+                    Identifier::new_with_scope(ident.name_id, ident.position, global_id, NameScope::Global),
                     false,
                 );
             }
@@ -799,20 +826,20 @@ impl Prepare {
         let (id, is_new) = match self.name_map.entry(name_str) {
             Entry::Occupied(e) => (*e.get(), false),
             Entry::Vacant(e) => {
-                let id = self.namespace_size;
+                let id = NamespaceId::new(self.namespace_size);
                 self.namespace_size += 1;
                 e.insert(id);
                 (id, true)
             }
         };
         (
-            Identifier::new_with_scope(ident.name, ident.position, id, NameScope::Local),
+            Identifier::new_with_scope(ident.name_id, ident.position, id, NameScope::Local),
             is_new,
         )
     }
 
     /// Prepares an f-string part by resolving names in interpolated expressions.
-    fn prepare_fstring_part<'c>(&mut self, part: FStringPart<'c>) -> Result<FStringPart<'c>, ParseError<'c>> {
+    fn prepare_fstring_part(&mut self, part: FStringPart) -> Result<FStringPart, ParseError> {
         match part {
             FStringPart::Literal(s) => Ok(FStringPart::Literal(s)),
             FStringPart::Interpolation {
@@ -868,7 +895,11 @@ struct FunctionScopeInfo {
 ///
 /// This information is used to determine whether each name reference should resolve
 /// to the local namespace, global namespace, or an enclosing scope via cells.
-fn collect_function_scope_info(nodes: &[ParseNode<'_>], params: &[&str]) -> FunctionScopeInfo {
+fn collect_function_scope_info(
+    nodes: &[ParseNode],
+    params: &[StringId],
+    interner: &InternerBuilder,
+) -> FunctionScopeInfo {
     let mut global_names = AHashSet::new();
     let mut nonlocal_names = AHashSet::new();
     let mut assigned_names = AHashSet::new();
@@ -876,20 +907,26 @@ fn collect_function_scope_info(nodes: &[ParseNode<'_>], params: &[&str]) -> Func
 
     // First pass: collect global, nonlocal, and assigned names
     for node in nodes {
-        collect_scope_info_from_node(node, &mut global_names, &mut nonlocal_names, &mut assigned_names);
+        collect_scope_info_from_node(
+            node,
+            &mut global_names,
+            &mut nonlocal_names,
+            &mut assigned_names,
+            interner,
+        );
     }
 
     // Build the set of our locals: params + assigned_names (excluding globals)
     let our_locals: AHashSet<String> = params
         .iter()
-        .map(|s| (*s).to_string())
+        .map(|string_id| interner.get(*string_id).to_string())
         .chain(assigned_names.iter().cloned())
         .filter(|name| !global_names.contains(name))
         .collect();
 
     // Second pass: find what nested functions capture from us
     for node in nodes {
-        collect_cell_vars_from_node(node, &our_locals, &mut cell_var_names);
+        collect_cell_vars_from_node(node, &our_locals, &mut cell_var_names, interner);
     }
 
     FunctionScopeInfo {
@@ -902,27 +939,28 @@ fn collect_function_scope_info(nodes: &[ParseNode<'_>], params: &[&str]) -> Func
 
 /// Helper to collect scope info from a single node.
 fn collect_scope_info_from_node(
-    node: &ParseNode<'_>,
+    node: &ParseNode,
     global_names: &mut AHashSet<String>,
     nonlocal_names: &mut AHashSet<String>,
     assigned_names: &mut AHashSet<String>,
+    interner: &InternerBuilder,
 ) {
     match node {
         ParseNode::Global(names) => {
-            for name in names {
-                global_names.insert((*name).to_string());
+            for string_id in names {
+                global_names.insert(interner.get(*string_id).to_string());
             }
         }
         ParseNode::Nonlocal(names) => {
-            for name in names {
-                nonlocal_names.insert((*name).to_string());
+            for string_id in names {
+                nonlocal_names.insert(interner.get(*string_id).to_string());
             }
         }
         ParseNode::Assign { target, .. } => {
-            assigned_names.insert(target.name.to_string());
+            assigned_names.insert(interner.get(target.name_id).to_string());
         }
         ParseNode::OpAssign { target, .. } => {
-            assigned_names.insert(target.name.to_string());
+            assigned_names.insert(interner.get(target.name_id).to_string());
         }
         ParseNode::SubscriptAssign { .. } => {
             // Subscript assignment doesn't create a new name, it modifies existing container
@@ -931,28 +969,28 @@ fn collect_scope_info_from_node(
             target, body, or_else, ..
         } => {
             // For loop target is assigned
-            assigned_names.insert(target.name.to_string());
+            assigned_names.insert(interner.get(target.name_id).to_string());
             // Recurse into body and else
             for n in body {
-                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names);
+                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names, interner);
             }
             for n in or_else {
-                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names);
+                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names, interner);
             }
         }
         ParseNode::If { body, or_else, .. } => {
             // Recurse into branches
             for n in body {
-                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names);
+                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names, interner);
             }
             for n in or_else {
-                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names);
+                collect_scope_info_from_node(n, global_names, nonlocal_names, assigned_names, interner);
             }
         }
         ParseNode::FunctionDef { name, .. } => {
             // Function definition creates a local binding for the function name
             // But we don't recurse into the function body - that's a separate scope
-            assigned_names.insert(name.name.to_string());
+            assigned_names.insert(interner.get(name.name_id).to_string());
         }
         // These don't create new names
         ParseNode::Pass
@@ -969,17 +1007,22 @@ fn collect_scope_info_from_node(
 /// For each FunctionDef node, we recursively analyze its body to find what names it
 /// references. Any name that is in `our_locals` and referenced by the nested function
 /// (not as a local of the nested function) becomes a cell_var.
-fn collect_cell_vars_from_node(node: &ParseNode<'_>, our_locals: &AHashSet<String>, cell_vars: &mut AHashSet<String>) {
+fn collect_cell_vars_from_node(
+    node: &ParseNode,
+    our_locals: &AHashSet<String>,
+    cell_vars: &mut AHashSet<String>,
+    interner: &InternerBuilder,
+) {
     match node {
         ParseNode::FunctionDef { params, body, .. } => {
             // Find what names are referenced inside this nested function
             let mut referenced = AHashSet::new();
             for n in body {
-                collect_referenced_names_from_node(n, &mut referenced);
+                collect_referenced_names_from_node(n, &mut referenced, interner);
             }
 
             // Collect the nested function's own locals (params + assigned)
-            let nested_scope = collect_function_scope_info(body, params);
+            let nested_scope = collect_function_scope_info(body, params, interner);
 
             // Any name that is:
             // - Referenced by the nested function
@@ -989,7 +1032,7 @@ fn collect_cell_vars_from_node(node: &ParseNode<'_>, our_locals: &AHashSet<Strin
             // becomes a cell_var
             for name in &referenced {
                 if !nested_scope.assigned_names.contains(name)
-                    && !params.contains(&name.as_str())
+                    && !params.iter().any(|p| interner.get(*p) == name)
                     && !nested_scope.global_names.contains(name)
                     && our_locals.contains(name)
                 {
@@ -1007,18 +1050,18 @@ fn collect_cell_vars_from_node(node: &ParseNode<'_>, our_locals: &AHashSet<Strin
         // Recurse into control flow structures
         ParseNode::For { body, or_else, .. } => {
             for n in body {
-                collect_cell_vars_from_node(n, our_locals, cell_vars);
+                collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
             for n in or_else {
-                collect_cell_vars_from_node(n, our_locals, cell_vars);
+                collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
         }
         ParseNode::If { body, or_else, .. } => {
             for n in body {
-                collect_cell_vars_from_node(n, our_locals, cell_vars);
+                collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
             for n in or_else {
-                collect_cell_vars_from_node(n, our_locals, cell_vars);
+                collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
         }
         // Other nodes don't contain nested function definitions
@@ -1029,49 +1072,49 @@ fn collect_cell_vars_from_node(node: &ParseNode<'_>, our_locals: &AHashSet<Strin
 /// Collects all names referenced (read) in a node and its descendants.
 ///
 /// This is used to find what names a nested function references from enclosing scopes.
-fn collect_referenced_names_from_node(node: &ParseNode<'_>, referenced: &mut AHashSet<String>) {
+fn collect_referenced_names_from_node(node: &ParseNode, referenced: &mut AHashSet<String>, interner: &InternerBuilder) {
     match node {
-        ParseNode::Expr(expr) => collect_referenced_names_from_expr(expr, referenced),
-        ParseNode::Return(expr) => collect_referenced_names_from_expr(expr, referenced),
-        ParseNode::Raise(Some(expr)) => collect_referenced_names_from_expr(expr, referenced),
+        ParseNode::Expr(expr) => collect_referenced_names_from_expr(expr, referenced, interner),
+        ParseNode::Return(expr) => collect_referenced_names_from_expr(expr, referenced, interner),
+        ParseNode::Raise(Some(expr)) => collect_referenced_names_from_expr(expr, referenced, interner),
         ParseNode::Raise(None) => {}
         ParseNode::Assert { test, msg } => {
-            collect_referenced_names_from_expr(test, referenced);
+            collect_referenced_names_from_expr(test, referenced, interner);
             if let Some(m) = msg {
-                collect_referenced_names_from_expr(m, referenced);
+                collect_referenced_names_from_expr(m, referenced, interner);
             }
         }
         ParseNode::Assign { object, .. } => {
-            collect_referenced_names_from_expr(object, referenced);
+            collect_referenced_names_from_expr(object, referenced, interner);
         }
         ParseNode::OpAssign { target, object, .. } => {
             // OpAssign reads the target before writing
-            referenced.insert(target.name.to_string());
-            collect_referenced_names_from_expr(object, referenced);
+            referenced.insert(interner.get(target.name_id).to_string());
+            collect_referenced_names_from_expr(object, referenced, interner);
         }
         ParseNode::SubscriptAssign { target, index, value } => {
-            referenced.insert(target.name.to_string());
-            collect_referenced_names_from_expr(index, referenced);
-            collect_referenced_names_from_expr(value, referenced);
+            referenced.insert(interner.get(target.name_id).to_string());
+            collect_referenced_names_from_expr(index, referenced, interner);
+            collect_referenced_names_from_expr(value, referenced, interner);
         }
         ParseNode::For {
             iter, body, or_else, ..
         } => {
-            collect_referenced_names_from_expr(iter, referenced);
+            collect_referenced_names_from_expr(iter, referenced, interner);
             for n in body {
-                collect_referenced_names_from_node(n, referenced);
+                collect_referenced_names_from_node(n, referenced, interner);
             }
             for n in or_else {
-                collect_referenced_names_from_node(n, referenced);
+                collect_referenced_names_from_node(n, referenced, interner);
             }
         }
         ParseNode::If { test, body, or_else } => {
-            collect_referenced_names_from_expr(test, referenced);
+            collect_referenced_names_from_expr(test, referenced, interner);
             for n in body {
-                collect_referenced_names_from_node(n, referenced);
+                collect_referenced_names_from_node(n, referenced, interner);
             }
             for n in or_else {
-                collect_referenced_names_from_node(n, referenced);
+                collect_referenced_names_from_node(n, referenced, interner);
             }
         }
         ParseNode::FunctionDef { .. } => {
@@ -1082,76 +1125,79 @@ fn collect_referenced_names_from_node(node: &ParseNode<'_>, referenced: &mut AHa
 }
 
 /// Collects all names referenced in an expression.
-fn collect_referenced_names_from_expr(expr: &crate::expressions::ExprLoc<'_>, referenced: &mut AHashSet<String>) {
+fn collect_referenced_names_from_expr(
+    expr: &crate::expressions::ExprLoc,
+    referenced: &mut AHashSet<String>,
+    interner: &InternerBuilder,
+) {
     use crate::expressions::Expr;
     match &expr.expr {
         Expr::Name(ident) => {
-            referenced.insert(ident.name.to_string());
+            referenced.insert(interner.get(ident.name_id).to_string());
         }
         Expr::Literal(_) => {}
-        Expr::Callable(callable) => {
-            // Check if the callable is a Name reference
-            if let crate::callable::Callable::Name(ident) = callable {
-                referenced.insert(ident.name.to_string());
-            }
-        }
+        Expr::Builtin(_) => {}
         Expr::List(items) | Expr::Tuple(items) => {
             for item in items {
-                collect_referenced_names_from_expr(item, referenced);
+                collect_referenced_names_from_expr(item, referenced, interner);
             }
         }
         Expr::Dict(pairs) => {
             for (key, value) in pairs {
-                collect_referenced_names_from_expr(key, referenced);
-                collect_referenced_names_from_expr(value, referenced);
+                collect_referenced_names_from_expr(key, referenced, interner);
+                collect_referenced_names_from_expr(value, referenced, interner);
             }
         }
         Expr::Op { left, right, .. } | Expr::CmpOp { left, right, .. } => {
-            collect_referenced_names_from_expr(left, referenced);
-            collect_referenced_names_from_expr(right, referenced);
+            collect_referenced_names_from_expr(left, referenced, interner);
+            collect_referenced_names_from_expr(right, referenced, interner);
         }
         Expr::Not(operand) | Expr::UnaryMinus(operand) => {
-            collect_referenced_names_from_expr(operand, referenced);
+            collect_referenced_names_from_expr(operand, referenced, interner);
         }
         Expr::FString(parts) => {
-            collect_referenced_names_from_fstring_parts(parts, referenced);
+            collect_referenced_names_from_fstring_parts(parts, referenced, interner);
         }
         Expr::Subscript { object, index } => {
-            collect_referenced_names_from_expr(object, referenced);
-            collect_referenced_names_from_expr(index, referenced);
+            collect_referenced_names_from_expr(object, referenced, interner);
+            collect_referenced_names_from_expr(index, referenced, interner);
         }
         Expr::Call { callable, args } => {
             // Check if the callable is a Name reference
             if let crate::callable::Callable::Name(ident) = callable {
-                referenced.insert(ident.name.to_string());
+                referenced.insert(interner.get(ident.name_id).to_string());
             }
-            collect_referenced_names_from_args(args, referenced);
+            collect_referenced_names_from_args(args, referenced, interner);
         }
         Expr::AttrCall { object, args, .. } => {
-            referenced.insert(object.name.to_string());
-            collect_referenced_names_from_args(args, referenced);
+            referenced.insert(interner.get(object.name_id).to_string());
+            collect_referenced_names_from_args(args, referenced, interner);
         }
         Expr::IfElse { test, body, orelse } => {
-            collect_referenced_names_from_expr(test, referenced);
-            collect_referenced_names_from_expr(body, referenced);
-            collect_referenced_names_from_expr(orelse, referenced);
+            collect_referenced_names_from_expr(test, referenced, interner);
+            collect_referenced_names_from_expr(body, referenced, interner);
+            collect_referenced_names_from_expr(orelse, referenced, interner);
         }
     }
 }
 
 /// Collects referenced names from argument expressions.
-fn collect_referenced_names_from_args(args: &crate::args::ArgExprs<'_>, referenced: &mut AHashSet<String>) {
+fn collect_referenced_names_from_args(
+    args: &crate::args::ArgExprs,
+    referenced: &mut AHashSet<String>,
+    interner: &InternerBuilder,
+) {
     use crate::args::ArgExprs;
     match args {
         ArgExprs::Zero => {}
-        ArgExprs::One(e) => collect_referenced_names_from_expr(e, referenced),
+        ArgExprs::One(e) => collect_referenced_names_from_expr(e, referenced, interner),
         ArgExprs::Two(e1, e2) => {
-            collect_referenced_names_from_expr(e1, referenced);
-            collect_referenced_names_from_expr(e2, referenced);
+            collect_referenced_names_from_expr(e1, referenced, interner);
+            collect_referenced_names_from_expr(e2, referenced, interner);
         }
         ArgExprs::Args(exprs) => {
             for e in exprs {
-                collect_referenced_names_from_expr(e, referenced);
+                collect_referenced_names_from_expr(e, referenced, interner);
             }
         }
         ArgExprs::Kwargs(_) | ArgExprs::ArgsKargs { .. } => {
@@ -1161,13 +1207,17 @@ fn collect_referenced_names_from_args(args: &crate::args::ArgExprs<'_>, referenc
 }
 
 /// Collects referenced names from f-string parts (both expressions and dynamic format specs).
-fn collect_referenced_names_from_fstring_parts(parts: &[FStringPart<'_>], referenced: &mut AHashSet<String>) {
+fn collect_referenced_names_from_fstring_parts(
+    parts: &[FStringPart],
+    referenced: &mut AHashSet<String>,
+    interner: &InternerBuilder,
+) {
     for part in parts {
         if let FStringPart::Interpolation { expr, format_spec, .. } = part {
-            collect_referenced_names_from_expr(expr, referenced);
+            collect_referenced_names_from_expr(expr, referenced, interner);
             // Also check dynamic format specs which can contain interpolated expressions
             if let Some(FormatSpec::Dynamic(spec_parts)) = format_spec {
-                collect_referenced_names_from_fstring_parts(spec_parts, referenced);
+                collect_referenced_names_from_fstring_parts(spec_parts, referenced, interner);
             }
         }
     }
