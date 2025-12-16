@@ -1,0 +1,14 @@
+[package]
+name = "monty-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "monty"
+path = "src/main.rs"
+
+[dependencies]
+monty = { path = "../monty" }
+
+[lints]
+workspace = true

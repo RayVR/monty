@@ -41,13 +41,13 @@ jobs:
       - run: rustc --version --verbose
 
       - name: Test without ref-counting feature or dec-ref-check
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Test with ref-counting feature
-        run: cargo test --features ref-counting
+        run: cargo test --workspace --features ref-counting
 
       - name: Test with dec-ref-check feature
-        run: cargo test --features dec-ref-check
+        run: cargo test --workspace --features dec-ref-check
 
   bench:
     runs-on: ubuntu-latest
@@ -57,7 +57,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - run: cargo bench -- --test
+      - run: cargo bench -p monty -- --test
 
   # https://github.com/marketplace/actions/alls-green#why used for branch protection checks
   check:

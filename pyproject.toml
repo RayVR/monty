@@ -14,11 +14,11 @@ dev = [
 line-length = 120
 include = [
     "scripts/**/*.py",
-    "test_cases/**/*.py",
+    "crates/monty/test_cases/**/*.py",
 ]
 # Exclude files with intentional syntax errors (used for testing parse error handling)
 extend-exclude = [
-    "test_cases/nonlocal__error_module_level.py",
+    "crates/monty/test_cases/nonlocal__error_module_level.py",
 ]
 
 [tool.ruff.lint]
@@ -41,7 +41,7 @@ ignore = [
     "E721", # Use `is` and `is not` for type comparisons, or `isinstance()` for isinstance checks
 ]
 # iter mode tests use external functions defined in the test runner
-per-file-ignores = { "test_cases/ext_call__*.py" = ["F821"] }
+per-file-ignores = { "crates/monty/test_cases/ext_call__*.py" = ["F821"] }
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -51,11 +51,13 @@ quote-style = "single"
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
 reportUnnecessaryTypeIgnoreComment = true
-include = ["scripts", "test_cases"]
+include = ["scripts", "crates/monty/test_cases"]
 venv = ".venv"
 
+# we include tests cases in type checking then switch off all rules that break
+# so the files don't show as errors in the IDE
 [[tool.pyright.executionEnvironments]]
-root = "test_cases"
+root = "crates/monty/test_cases"
 reportUnusedExpression = false
 reportOperatorIssue = false
 reportGeneralTypeIssues = false

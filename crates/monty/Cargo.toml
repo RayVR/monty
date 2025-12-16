@@ -1,0 +1,43 @@
+[package]
+name = "monty"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "monty"
+path = "src/lib.rs"
+
+[dependencies]
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", package = "ruff_python_parser", branch = "main" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", package = "ruff_python_ast", branch = "main" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", package = "ruff_text_size", branch = "main" }
+ahash = "0.8.0"
+indexmap = { version = "2.9", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+enum_dispatch = "0.3.13"
+strum = { version = "0.25", features = ["derive"] }
+strum_macros = "0.25"
+smallvec = "1.11"
+
+[features]
+ref-counting = []
+dec-ref-check = []
+
+[dev-dependencies]
+paste = "1.0.7"
+pyo3 = { version = "0.19.0", features = ["auto-initialize"] }
+criterion = "0.5"
+datatest-stable = "0.2"
+pprof = { version = "0.15", features = ["flamegraph", "criterion"] }
+
+[[bench]]
+name = "main"
+harness = false
+
+[[test]]
+name = "datatest_runner"
+harness = false
+
+[lints]
+workspace = true
