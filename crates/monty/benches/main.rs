@@ -3,6 +3,8 @@ use monty::Executor;
 use pprof::criterion::{Output, PProfProfiler};
 
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
+use std::ffi::CString;
 
 /// Benchmarks adding two numbers using Monty interpreter
 fn add_two_monty(bench: &mut Bencher) {
@@ -21,14 +23,14 @@ fn add_two_monty(bench: &mut Bencher) {
 
 /// Benchmarks adding two numbers using CPython
 fn add_two_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
-        let fun: PyObject = PyModule::from_code(
+    Python::attach(|py| {
+        let fun: Py<PyAny> = PyModule::from_code(
             py,
-            "def main():
+            c"def main():
                 return 1 + 2
             ",
-            "test.py",
-            "main",
+            c"test.py",
+            c"main",
         )
         .unwrap()
         .getattr("main")
@@ -71,16 +73,16 @@ a['key']
 }
 
 fn dict_set_get_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
-        let fun: PyObject = PyModule::from_code(
+    Python::attach(|py| {
+        let fun: Py<PyAny> = PyModule::from_code(
             py,
-            "def main():
+            c"def main():
                 a = {}
                 a['key'] = 'value'
                 return a['key']
             ",
-            "test.py",
-            "main",
+            c"test.py",
+            c"main",
         )
         .unwrap()
         .getattr("main")
@@ -124,16 +126,16 @@ a[0]
 
 /// Benchmarks adding two numbers using CPython
 fn list_append_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
-        let fun: PyObject = PyModule::from_code(
+    Python::attach(|py| {
+        let fun: Py<PyAny> = PyModule::from_code(
             py,
-            "def main():
+            c"def main():
                 a = []
                 a.append(42)
                 return a[0]
             ",
-            "test.py",
-            "main",
+            c"test.py",
+            c"main",
         )
         .unwrap()
         .getattr("main")
@@ -177,19 +179,19 @@ fn loop_mod_13_monty(bench: &mut Bencher) {
 
 /// Benchmarks a loop with modulo operations using CPython
 fn loop_mod_13_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
-        let fun: PyObject = PyModule::from_code(
+    Python::attach(|py| {
+        let fun: Py<PyAny> = PyModule::from_code(
             py,
             // language=Python
-            "def main():
+            c"def main():
                 v = ''
                 for i in range(1_000):
                     if i % 13 == 0:
                         v += 'x'
                 return len(v)
             ",
-            "test.py",
-            "main",
+            c"test.py",
+            c"main",
         )
         .unwrap()
         .getattr("main")
@@ -220,13 +222,14 @@ fn end_to_end_monty(bench: &mut Bencher) {
 
 /// Benchmarks end-to-end execution (parsing + running) using CPython
 fn end_to_end_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         bench.iter(|| {
-            let fun: PyObject = PyModule::from_code(py, black_box("def main():\n  return 1 + 2"), "test.py", "main")
-                .unwrap()
-                .getattr("main")
-                .unwrap()
-                .into();
+            let fun: Py<PyAny> =
+                PyModule::from_code(py, black_box(c"def main():\n  return 1 + 2"), c"test.py", c"main")
+                    .unwrap()
+                    .getattr("main")
+                    .unwrap()
+                    .into();
             let r_py = fun.call0(py).unwrap();
             let r: i64 = r_py.extract(py).unwrap();
             black_box(r);
@@ -282,9 +285,10 @@ fn wrap_for_cpython(code: &str) -> String {
 
 /// Benchmarks comprehensive feature coverage using CPython
 fn kitchen_sink_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let code = wrap_for_cpython(KITCHEN_SINK_CODE);
-        let fun: PyObject = PyModule::from_code(py, &code, "test.py", "main")
+        let code_cstr = CString::new(code).expect("Invalid C string in code");
+        let fun: Py<PyAny> = PyModule::from_code(py, &code_cstr, c"test.py", c"main")
             .unwrap()
             .getattr("main")
             .unwrap()
@@ -326,17 +330,17 @@ fn func_call_kwargs_monty(bench: &mut Bencher) {
 
 /// Benchmarks function call with keyword arguments using CPython
 fn func_call_kwargs_cpython(bench: &mut Bencher) {
-    Python::with_gil(|py| {
-        let fun: PyObject = PyModule::from_code(
+    Python::attach(|py| {
+        let fun: Py<PyAny> = PyModule::from_code(
             py,
             // language=Python
-            "def main():
+            c"def main():
                 def add(a, b=2):
                     return a + b
                 return add(a=1)
             ",
-            "test.py",
-            "main",
+            c"test.py",
+            c"main",
         )
         .unwrap()
         .getattr("main")

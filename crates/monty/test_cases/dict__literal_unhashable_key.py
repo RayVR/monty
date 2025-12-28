@@ -1,2 +1,2 @@
 {'a': 1, []: 2}
-# Raise=TypeError("unhashable type: 'list'")
+# Raise=TypeError("cannot use 'list' as a dict key (unhashable type: 'list')")

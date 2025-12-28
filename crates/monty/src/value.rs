@@ -550,7 +550,6 @@ impl PyTrait for Value {
     fn py_div(&self, other: &Self, _heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Value>> {
         match (self, other) {
             // True division always returns float
-            // Note: int/int uses "division by zero", float cases use "float division by zero"
             (Self::Int(a), Self::Int(b)) => {
                 if *b == 0 {
                     Err(ExcType::zero_division().into())
@@ -560,21 +559,21 @@ impl PyTrait for Value {
             }
             (Self::Float(a), Self::Float(b)) => {
                 if *b == 0.0 {
-                    Err(ExcType::zero_division_float().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float(a / b)))
                 }
             }
             (Self::Int(a), Self::Float(b)) => {
                 if *b == 0.0 {
-                    Err(ExcType::zero_division_float().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float(*a as f64 / b)))
                 }
             }
             (Self::Float(a), Self::Int(b)) => {
                 if *b == 0 {
-                    Err(ExcType::zero_division_float().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float(a / *b as f64)))
                 }
@@ -596,7 +595,7 @@ impl PyTrait for Value {
             }
             (Self::Bool(a), Self::Float(b)) => {
                 if *b == 0.0 {
-                    Err(ExcType::zero_division_float().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float(f64::from(*a) / b)))
                 }
@@ -605,7 +604,7 @@ impl PyTrait for Value {
                 if *b {
                     Ok(Some(Value::Float(*a))) // a / 1.0 = a
                 } else {
-                    Err(ExcType::zero_division_float().into())
+                    Err(ExcType::zero_division().into())
                 }
             }
             (Self::Bool(a), Self::Bool(b)) => {
@@ -624,7 +623,7 @@ impl PyTrait for Value {
             // Floor division: int // int returns int
             (Self::Int(a), Self::Int(b)) => {
                 if *b == 0 {
-                    Err(ExcType::zero_division_int().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     // Python floor division rounds toward negative infinity
                     // div_euclid doesn't match Python semantics, so compute manually
@@ -638,21 +637,21 @@ impl PyTrait for Value {
             // Float floor division returns float
             (Self::Float(a), Self::Float(b)) => {
                 if *b == 0.0 {
-                    Err(ExcType::zero_division_float_floor().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float((a / b).floor())))
                 }
             }
             (Self::Int(a), Self::Float(b)) => {
                 if *b == 0.0 {
-                    Err(ExcType::zero_division_float_floor().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float((*a as f64 / b).floor())))
                 }
             }
             (Self::Float(a), Self::Int(b)) => {
                 if *b == 0 {
-                    Err(ExcType::zero_division_float_floor().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float((a / *b as f64).floor())))
                 }
@@ -660,7 +659,7 @@ impl PyTrait for Value {
             // Bool floor division (True=1, False=0)
             (Self::Bool(a), Self::Int(b)) => {
                 if *b == 0 {
-                    Err(ExcType::zero_division_int().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     let a_int = i64::from(*a);
                     // Use same floor division logic as Int // Int
@@ -674,12 +673,12 @@ impl PyTrait for Value {
                 if *b {
                     Ok(Some(Value::Int(*a))) // a // 1 = a
                 } else {
-                    Err(ExcType::zero_division_int().into())
+                    Err(ExcType::zero_division().into())
                 }
             }
             (Self::Bool(a), Self::Float(b)) => {
                 if *b == 0.0 {
-                    Err(ExcType::zero_division_float_floor().into())
+                    Err(ExcType::zero_division().into())
                 } else {
                     Ok(Some(Value::Float((f64::from(*a) / b).floor())))
                 }
@@ -688,14 +687,14 @@ impl PyTrait for Value {
                 if *b {
                     Ok(Some(Value::Float(a.floor()))) // a // 1.0 = floor(a)
                 } else {
-                    Err(ExcType::zero_division_float_floor().into())
+                    Err(ExcType::zero_division().into())
                 }
             }
             (Self::Bool(a), Self::Bool(b)) => {
                 if *b {
                     Ok(Some(Value::Int(i64::from(*a)))) // a // 1 = a
                 } else {
-                    Err(ExcType::zero_division_int().into())
+                    Err(ExcType::zero_division().into())
                 }
             }
             _ => Ok(None),

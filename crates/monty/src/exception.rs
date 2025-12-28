@@ -111,12 +111,30 @@ impl ExcType {
         exc_fmt!(Self::TypeError; "'{type_}' object does not support item assignment").into()
     }
 
-    /// Creates a TypeError for unhashable types (e.g., list, dict used as dict keys).
+    /// Creates a TypeError for unhashable types when calling `hash()`.
     ///
-    /// This matches Python's error message: `TypeError: unhashable type: 'list'`
+    /// This matches Python 3.14's error message: `TypeError: unhashable type: 'list'`
     #[must_use]
     pub fn type_error_unhashable(type_: Type) -> RunError {
         exc_fmt!(Self::TypeError; "unhashable type: '{type_}'").into()
+    }
+
+    /// Creates a TypeError for unhashable types used as dict keys.
+    ///
+    /// This matches Python 3.14's error message:
+    /// `TypeError: cannot use 'list' as a dict key (unhashable type: 'list')`
+    #[must_use]
+    pub fn type_error_unhashable_dict_key(type_: Type) -> RunError {
+        exc_fmt!(Self::TypeError; "cannot use '{type_}' as a dict key (unhashable type: '{type_}')").into()
+    }
+
+    /// Creates a TypeError for unhashable types used as set elements.
+    ///
+    /// This matches Python 3.14's error message:
+    /// `TypeError: cannot use 'list' as a set element (unhashable type: 'list')`
+    #[must_use]
+    pub fn type_error_unhashable_set_element(type_: Type) -> RunError {
+        exc_fmt!(Self::TypeError; "cannot use '{type_}' as a set element (unhashable type: '{type_}')").into()
     }
 
     /// Creates a KeyError for a missing dict key.
@@ -434,44 +452,20 @@ impl ExcType {
         exc_fmt!(Self::NotImplementedError; "The monty syntax parser does not yet support {}", feature)
     }
 
-    /// Creates a ZeroDivisionError for true division by zero (int / int case).
+    /// Creates a ZeroDivisionError for division by zero.
     ///
-    /// Matches CPython's format: `ZeroDivisionError('division by zero')`
+    /// Matches CPython 3.14's format: `ZeroDivisionError('division by zero')`
     #[must_use]
     pub fn zero_division() -> SimpleException {
         exc_static!(Self::ZeroDivisionError; "division by zero")
     }
 
-    /// Creates a ZeroDivisionError for float division by zero.
-    ///
-    /// Matches CPython's format: `ZeroDivisionError('float division by zero')`
-    #[must_use]
-    pub fn zero_division_float() -> SimpleException {
-        exc_static!(Self::ZeroDivisionError; "float division by zero")
-    }
-
-    /// Creates a ZeroDivisionError for integer division or modulo by zero.
-    ///
-    /// Matches CPython's format: `ZeroDivisionError('integer division or modulo by zero')`
-    #[must_use]
-    pub fn zero_division_int() -> SimpleException {
-        exc_static!(Self::ZeroDivisionError; "integer division or modulo by zero")
-    }
-
-    /// Creates a ZeroDivisionError for float floor division by zero.
-    ///
-    /// Matches CPython's format: `ZeroDivisionError('float floor division by zero')`
-    #[must_use]
-    pub fn zero_division_float_floor() -> SimpleException {
-        exc_static!(Self::ZeroDivisionError; "float floor division by zero")
-    }
-
     /// Creates a ZeroDivisionError for 0 raised to a negative power.
     ///
-    /// Matches CPython's format: `ZeroDivisionError('0.0 cannot be raised to a negative power')`
+    /// Matches CPython 3.14's format: `ZeroDivisionError('zero to a negative power')`
     #[must_use]
     pub fn zero_pow_negative() -> SimpleException {
-        exc_static!(Self::ZeroDivisionError; "0.0 cannot be raised to a negative power")
+        exc_static!(Self::ZeroDivisionError; "zero to a negative power")
     }
 
     /// Creates an OverflowError for string/sequence repetition with count too large.

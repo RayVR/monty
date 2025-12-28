@@ -1,9 +1,13 @@
-use ahash::AHashMap;
-use monty::{ExecProgress, Executor, ExecutorIter, PyObject, PythonException, ResourceLimits, StdPrint};
-use pyo3::prelude::*;
 use std::error::Error;
+use std::ffi::CString;
 use std::fs;
 use std::path::Path;
+
+use ahash::AHashMap;
+use monty::{ExecProgress, Executor, ExecutorIter, PyObject, PythonException, ResourceLimits, StdPrint};
+
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// Recursion limit for test execution.
 ///
@@ -680,7 +684,7 @@ fn split_code_for_module(code: &str, need_return_value: bool) -> (String, Option
 /// which executes the file via runpy.run_path() to ensure full traceback information
 /// (including caret lines) is preserved.
 fn run_traceback_script(path: &Path) -> String {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         // Add scripts directory to sys.path (tests run from crates/monty/)
         let sys = py.import("sys").expect("Failed to import sys");
         let sys_path = sys.getattr("path").expect("Failed to get sys.path");
@@ -758,12 +762,13 @@ fn try_run_cpython_test(path: &Path, code: &str, expectation: &Expectation) -> R
     );
     let (statements, maybe_expr) = split_code_for_module(code, need_return_value);
 
-    let result: CpythonResult = Python::with_gil(|py| {
+    let result: CpythonResult = Python::attach(|py| {
         // Execute statements at module level
-        let globals = pyo3::types::PyDict::new(py);
+        let globals = PyDict::new(py);
 
         // Run the statements
-        let stmt_result = py.run(&statements, Some(globals), None);
+        let statements_cstr = CString::new(statements.as_str()).expect("Invalid C string in statements");
+        let stmt_result = py.run(&statements_cstr, Some(&globals), None);
 
         // Handle exception during statement execution
         if let Err(e) = stmt_result {
@@ -788,7 +793,8 @@ fn try_run_cpython_test(path: &Path, code: &str, expectation: &Expectation) -> R
 
         // If we have an expression to evaluate, evaluate it
         if let Some(expr) = maybe_expr {
-            match py.eval(&expr, Some(globals), None) {
+            let expr_cstr = CString::new(expr.as_str()).expect("Invalid C string in expr");
+            match py.eval(&expr_cstr, Some(&globals), None) {
                 Ok(result) => {
                     // Code returned successfully - format based on expectation type
                     match expectation {
@@ -865,13 +871,13 @@ fn try_run_cpython_test(path: &Path, code: &str, expectation: &Expectation) -> R
 }
 
 /// Format a CPython exception into the expected format.
-fn format_cpython_exception(py: Python<'_>, e: &pyo3::PyErr) -> String {
+fn format_cpython_exception(py: Python<'_>, e: &PyErr) -> String {
     let exc_type = e.get_type(py).name().unwrap();
     let exc_message: String = e
         .value(py)
         .getattr("args")
         .and_then(|args| args.get_item(0))
-        .and_then(pyo3::PyAny::extract)
+        .and_then(|item| item.extract())
         .unwrap_or_default();
 
     if exc_message.is_empty() {

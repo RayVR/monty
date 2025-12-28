@@ -200,7 +200,7 @@ impl Dict {
     ) -> RunResult<Option<(Value, Value)>> {
         let hash = key
             .py_hash(heap, interns)
-            .ok_or_else(|| ExcType::type_error_unhashable(key.py_type(Some(heap))))?;
+            .ok_or_else(|| ExcType::type_error_unhashable_dict_key(key.py_type(Some(heap))))?;
 
         let entry = self.indices.entry(
             hash,
@@ -361,7 +361,7 @@ impl Dict {
     ) -> RunResult<(Option<usize>, u64)> {
         let hash = key
             .py_hash(heap, interns)
-            .ok_or_else(|| ExcType::type_error_unhashable(key.py_type(Some(heap))))?;
+            .ok_or_else(|| ExcType::type_error_unhashable_dict_key(key.py_type(Some(heap))))?;
 
         let opt_index = self
             .indices

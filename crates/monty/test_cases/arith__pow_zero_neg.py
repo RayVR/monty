@@ -1,2 +1,2 @@
 0**-1
-# Raise=ZeroDivisionError('0.0 cannot be raised to a negative power')
+# Raise=ZeroDivisionError('zero to a negative power')

@@ -1,2 +1,2 @@
 {{'a': 1}: 'value'}
-# Raise=TypeError("unhashable type: 'dict'")
+# Raise=TypeError("cannot use 'dict' as a dict key (unhashable type: 'dict')")

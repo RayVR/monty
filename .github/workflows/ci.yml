@@ -10,6 +10,7 @@ on:
 
 env:
   COLUMNS: 150
+  UV_PYTHON: "3.14"
 
 jobs:
   lint:
@@ -23,10 +24,13 @@ jobs:
           components: rustfmt, clippy
 
       - uses: astral-sh/setup-uv@v7
+      - run: uv sync
 
-      - uses: pre-commit/action@v3.0.0
+      - uses: actions/cache@v4
         with:
-          extra_args: --all-files --verbose
+          path: ~/.cache/pre-commit
+          key: pre-commit|${{ env.UV_PYTHON }}|${{ hashFiles('.pre-commit-config.yaml') }}
+      - run: uvx pre-commit run --color=always --all-files --verbose
         env:
           SKIP: test
 
@@ -38,13 +42,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # this means pyo3 will use Python 3.13 in tests
+      # this means pyo3 will use Python 3.14 in tests
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - run: rustc --version --verbose
       - run: python3 -V
+        # don't use .venv python python in CI
+      - run: rm .cargo/config.toml
 
       - name: Test without ref-counting feature or dec-ref-check
         run: cargo test --workspace
@@ -62,6 +68,12 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+        # don't use .venv python python in CI
+      - run: rm .cargo/config.toml
 
       - run: cargo bench -p monty -- --test
 
