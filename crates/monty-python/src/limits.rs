@@ -157,14 +157,6 @@ impl<T: ResourceTracker> ResourceTracker for PySignalTracker<T> {
         self.check_python_signals()
     }
 
-    fn should_gc(&self) -> bool {
-        self.inner.should_gc()
-    }
-
-    fn on_gc_complete(&mut self) {
-        self.inner.on_gc_complete();
-    }
-
     fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
         self.inner.check_recursion_depth(current_depth)
     }

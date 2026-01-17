@@ -123,20 +123,6 @@ pub trait ResourceTracker: fmt::Debug {
     /// if the limit is exceeded.
     fn check_time(&mut self) -> Result<(), ResourceError>;
 
-    /// Returns true if garbage collection should run.
-    ///
-    /// Called at statement boundaries where we have access to GC roots.
-    ///
-    ///  Note: GC won't run during long-running single expressions (e.g., large list
-    /// comprehensions). This is acceptable because most Python code is structured
-    /// as multiple statements, and resource limits (time, memory) still apply.
-    fn should_gc(&self) -> bool;
-
-    /// Called after garbage collection completes.
-    ///
-    /// Used to reset internal counters (e.g., allocations since last GC).
-    fn on_gc_complete(&mut self);
-
     /// Called before pushing a new call frame to check recursion depth.
     ///
     /// Returns `Ok(())` if within recursion limit, or `Err(ResourceError::Recursion)`
@@ -147,29 +133,15 @@ pub trait ResourceTracker: fmt::Debug {
     fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError>;
 }
 
-/// Default GC interval for `NoLimitTracker` - run GC every 100,000 allocations.
-///
-/// This is intentionally very infrequent to minimize overhead while still
-/// eventually collecting reference cycles.
-const DEFAULT_GC_INTERVAL: usize = 100_000;
-
-/// A resource tracker that imposes no limits but still triggers infrequent GC.
-///
-/// This tracker does not enforce any resource limits (allocations, time, memory),
-/// but still triggers garbage collection periodically to collect reference cycles.
-/// GC runs every 100,000 allocations by default.
+/// A resource tracker that imposes no limits except default recursion limit.
 ///
 /// Recursion limit is set to the cpython default of 1000.
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NoLimitTracker {
-    /// Number of allocations since last garbage collection.
-    allocations_since_gc: usize,
-}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NoLimitTracker;
 
 impl ResourceTracker for NoLimitTracker {
     #[inline]
     fn on_allocate(&mut self, _: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        self.allocations_since_gc += 1;
         Ok(())
     }
 
@@ -179,16 +151,6 @@ impl ResourceTracker for NoLimitTracker {
     #[inline]
     fn check_time(&mut self) -> Result<(), ResourceError> {
         Ok(())
-    }
-
-    #[inline]
-    fn should_gc(&self) -> bool {
-        self.allocations_since_gc >= DEFAULT_GC_INTERVAL
-    }
-
-    #[inline]
-    fn on_gc_complete(&mut self) {
-        self.allocations_since_gc = 0;
     }
 
     /// Set the recursion limit to 1000.
@@ -293,8 +255,6 @@ pub struct LimitedTracker {
     allocation_count: usize,
     /// Current approximate memory usage in bytes.
     current_memory: usize,
-    /// Number of allocations since last garbage collection.
-    allocations_since_gc: usize,
 }
 
 impl LimitedTracker {
@@ -309,7 +269,6 @@ impl LimitedTracker {
             start_time: Instant::now(),
             allocation_count: 0,
             current_memory: 0,
-            allocations_since_gc: 0,
         }
     }
 
@@ -359,7 +318,6 @@ impl ResourceTracker for LimitedTracker {
         // Update tracking state
         self.allocation_count += 1;
         self.current_memory += size;
-        self.allocations_since_gc += 1;
 
         Ok(())
     }
@@ -376,16 +334,6 @@ impl ResourceTracker for LimitedTracker {
             }
         }
         Ok(())
-    }
-
-    fn should_gc(&self) -> bool {
-        self.limits
-            .gc_interval
-            .is_some_and(|interval| self.allocations_since_gc >= interval)
-    }
-
-    fn on_gc_complete(&mut self) {
-        self.allocations_since_gc = 0;
     }
 
     fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
