@@ -81,8 +81,23 @@ jobs:
         # don't use .venv python in CI
       - run: rm .cargo/config.toml
 
-      # run rust tests with coverage
-      - run: make testcov
+      # coverage for `make test-no-features`
+      - run: cargo llvm-cov --no-report -p monty
+      # coverage for `make test-ref-count-panic`
+      - run: cargo llvm-cov --no-report -p monty --features ref-count-panic
+      # coverage for `make test-ref-count-return`
+      - run: cargo llvm-cov --no-report -p monty --features ref-count-return
+      # coverage for `make test-type-checking`
+      - run: cargo llvm-cov --no-report -p monty_type_checking -p monty_typeshed
+      # Generating text report:
+      - run: cargo llvm-cov report --ignore-filename-regex '(tests/|test_cases/|/tests\.rs$$)'
+      # Generate codecov report (use `report` subcommand to avoid recompilation)
+      - run: cargo llvm-cov report --codecov --output-path=codecov.json --ignore-filename-regex '(tests/|test_cases/|/tests\.rs$$)'
+
+      - uses: codecov/codecov-action@v5
+        with:
+          files: codecov.json
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   test-python:
     name: test python ${{ matrix.python-version }}
